@@ -1601,6 +1601,12 @@ def make_linear_exl3(
     """Build a LinearEXL3 over already-sharded packed tensors. No BF16 expand."""
     if out_dtype is None and torch is not None:
         out_dtype = torch.float16
+    import os as _os
+    if _os.environ.get("EXL3_APPLY_DEBUG"):
+        import sys as _sys
+        print(f"[apply] make_linear_exl3: suh={tuple(suh.shape)} svh={tuple(svh.shape)} "
+              f"trellis={tuple(trellis.shape)} in={int(suh.numel())} out={int(svh.numel())}",
+              file=_sys.stderr, flush=True)
     cls = load_linear_exl3_cls()
     return cls(
         config=None,
@@ -6616,6 +6622,13 @@ class Exl3LinearMethod(LinearMethodBase):
                 )
 
         # Build LinearEXL3 objects for EXL3 shards only (skip bf16 shards).
+        # Batched (bmm) layers: one linear per SLICE (the layer's single
+        # vLLM partition covers bmm_slices group matrices). Slice i's
+        # trellis occupies out-tile span [i*t : (i+1)*t] where t =
+        # out_tiles // bmm_slices; suh row i; svh span [i*s : (i+1)*s]
+        # with s = svh_numel // bmm_slices.
+        _is_bmm = bool(getattr(layer, "_exl3_linear_is_bmm", False))
+        _bmm_n = int(getattr(layer, "_exl3_bmm_slices", 0) or 0)
         # Coalesce consecutive shards that share identical suh, K, and codebook markers
         # (e.g. Qwen3.5/Ornith in_proj_qkvz shards 0, 1, 2 from fused in_proj_qkv).
         padded = bool(getattr(layer, "_exl3_linear_padded", False))
@@ -6630,7 +6643,20 @@ class Exl3LinearMethod(LinearMethodBase):
             and os.environ.get("VLLM_EXL3_COALESCE_SHARDS", "1") != "0"
         )
         linears = []
-        if coalesce_shards:
+        if _is_bmm and _bmm_n > 1:
+            _t = layer.trellis.shape[1] // _bmm_n
+            _s = layer.svh.shape[0] // _bmm_n
+            for i in range(_bmm_n):
+                trellis_shard = layer.trellis[:, i * _t : (i + 1) * _t, :].contiguous()
+                suh_shard = layer.suh[i].contiguous()
+                svh_shard = layer.svh[i * _s : (i + 1) * _s].contiguous()
+                # Markers are uniform across slices (loader comment 2970)
+                mcg_shard = layer.mcg[0].contiguous() if layer.mcg[0].item() != 0 else None
+                mul1_shard = layer.mul1[0].contiguous() if layer.mul1[0].item() != 0 else None
+                linears.append(
+                    make_linear_exl3(trellis_shard, suh_shard, svh_shard, mcg_shard, mul1_shard, out_dtype=torch.float16)
+                )
+        elif coalesce_shards:
             i = 0
             while i < n_shards:
                 t0 = layer._exl3_shard_trellis[i].detach().contiguous()
@@ -6879,6 +6905,27 @@ class Exl3LinearMethod(LinearMethodBase):
             x_2d = x.reshape(rows, orig_shape[-1])
         else:
             x_2d = x
+
+        # Batched (bmm) layers: slice i pairs with group i along the
+        # group dim (dim -2 of the 3D input). Each slice processes ONLY
+        # its own group's rows; outputs concatenate along the last dim.
+        # (Running all slices on all rows and concatenating would give
+        # each group every slice's output — doubling z's width.)
+        _bmm_slices = getattr(layer, "_exl3_bmm_slices", 0)
+        if (
+            _bmm_slices > 1
+            and len(orig_shape) == 3
+            and orig_shape[-2] == _bmm_slices
+        ):
+            outs = []
+            for i in range(_bmm_slices):
+                linear = linears[i]
+                if linear is None:
+                    raise RuntimeError(f"EXL3 bmm slice {i} is None")
+                xi = x[:, i, :].to(torch.float16).contiguous()
+                outs.append(_dense_forward(linear, xi))
+            y = torch.cat(outs, dim=-1).to(dtype=x.dtype)
+            return y
 
         # Cast to contiguous fp16 for EXL3 shards
         x_fp16 = x_2d.to(torch.float16).contiguous()
