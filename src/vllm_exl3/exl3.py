@@ -5114,6 +5114,11 @@ class Exl3LinearMethod(LinearMethodBase):
 
         # vLLM calls ``weight_loader(param, loaded_weight[, shard_id])`` and
         # never passes the checkpoint name, so bind the tensor kind per param.
+        # Batched (bmm) layers: the checkpoint's slice tensors are
+        # rank-local (the slice structure accounts for TP) — the
+        # loader must NOT apply TP narrowing to them.
+        is_bmm = bool(getattr(layer, "is_bmm", False))
+        layer._exl3_linear_is_bmm = is_bmm
         for suffix, p in (
             ("trellis", trellis_param),
             ("suh", suh_param),
@@ -5129,6 +5134,7 @@ class Exl3LinearMethod(LinearMethodBase):
                 bf16_shards,
                 layer,
                 is_qkv_parallel,
+                is_bmm=is_bmm,
             )
         weight_param.weight_loader = self._make_weight_loader(
             "weight",
@@ -5161,6 +5167,7 @@ class Exl3LinearMethod(LinearMethodBase):
         bf16_shards,
         layer=None,
         is_qkv_parallel=False,
+        is_bmm=False,
     ):
         """Create a weight_loader closure for EXL3 linear parameters."""
 
@@ -5305,6 +5312,24 @@ class Exl3LinearMethod(LinearMethodBase):
             # Normal EXL3 suffix handling (trellis, suh, svh)
             loaded = loaded_weight.detach().contiguous()
 
+            # Batched (bmm) layers: the checkpoint's slice tensors are
+            # rank-local — the slice structure accounts for TP. Skip the
+            # TP narrowing; the dest segment arithmetic below handles
+            # placement.
+            if is_bmm:
+                if suffix == "svh":
+                    dest = param.data  # single-shard param; full write
+                    if tuple(dest.shape) != tuple(loaded.shape):
+                        raise RuntimeError(
+                            f"EXL3 bmm svh shape mismatch: dest {tuple(dest.shape)} != "
+                            f"loaded {tuple(loaded.shape)}"
+                        )
+                    dest.copy_(loaded)
+                    return
+                # suh/trellis/markers fall through to the standard path
+                # (suh/trellis cover the full input, unsharded for
+                # ColumnParallel bmm layers; markers span all shards).
+
             expected_out = output_partition_sizes[shard_idx]
             if is_qkv_parallel and not is_row_parallel:
                 total_out = (
@@ -5356,6 +5381,13 @@ class Exl3LinearMethod(LinearMethodBase):
                 raise ValueError(f"unknown EXL3 suffix={suffix}")
 
             if tuple(dest.shape) != tuple(sharded.shape):
+                # Rank-local checkpoint tensors (batched/bmm layers whose
+                # slice structure already accounts for TP): the TP narrowing
+                # above is wrong for them. Retry with the un-narrowed
+                # tensor — if it fits the dest segment exactly, accept it.
+                if tuple(dest.shape) == tuple(loaded.shape):
+                    dest.copy_(loaded)
+                    return
                 raise RuntimeError(
                     f"EXL3 linear load shape mismatch shard={shard_idx} "
                     f"suffix={suffix}: dest {tuple(dest.shape)} != "
