@@ -5735,11 +5735,32 @@ class Exl3LinearMethod(LinearMethodBase):
                         f"for n_shards={n_shards}"
                     )
                 if suffix == "suh":
-                    # Suh rows are per-shard input scales: the span
-                    # tensor holds each covered shard's rows
-                    # concatenated. Slice per shard — passing the FULL
-                    # tensor to every shard's write would corrupt all
-                    # but the first shard's scales.
+                    # Suh rows are per-shard INPUT scales. The span
+                    # tensor is one calibration group's suh shared by
+                    # every covered shard (in_proj_qkv -> q,k,v: one
+                    # [in_features] tensor) — write it FULL to each
+                    # covered row. Slicing by output sizes corrupts:
+                    # input-side scales have no per-shard boundaries.
+                    # A concatenated layout (length == sum of row
+                    # lengths) is sliced at row boundaries instead.
+                    _row = (
+                        int(param.data.shape[1])
+                        if param.data.dim() == 2
+                        else int(param.data.shape[0])
+                    )
+                    _len = int(loaded_weight.shape[0])
+                    if _len == _row:
+                        for i in ids:
+                            weight_loader(param, loaded_weight, i)
+                        return
+                    if _len == _row * len(ids):
+                        for _off, i in enumerate(ids):
+                            weight_loader(
+                                param,
+                                loaded_weight[_off * _row : (_off + 1) * _row],
+                                i,
+                            )
+                        return
                     start = 0
                     for i in ids:
                         size = output_partition_sizes[i]
@@ -5756,21 +5777,19 @@ class Exl3LinearMethod(LinearMethodBase):
                     else int(loaded_weight.shape[0])
                 )
                 span = sum(output_partition_sizes[i] for i in ids)
+                is_full_ckpt = False
                 if loaded_out != span:
                     # TP-sharded merged layer: the checkpoint tensor covers
                     # the FULL output (every rank's span) while this rank's
-                    # params hold only its shard — narrow to this rank's
-                    # contiguous slice before splitting at shard boundaries.
+                    # params hold only its shard. Slice pieces at FULL
+                    # shard boundaries below — each recursive call narrows
+                    # its piece to this rank's contiguous slice. Pre-narrow
+                    # the whole tensor to this rank's contiguous slice
+                    # instead and shards with unequal sizes interleave
+                    # (v tiles landing on the q/k shards — audit-verified
+                    # on the Qwen3.8-27B SC pack's in_proj_qkvz).
                     if loaded_out == span * tp_size:
-                        dim = 1 if suffix == "trellis" else 0
-                        per = loaded_out // tp_size
-                        lo = per * tp_rank
-                        loaded_weight = (
-                            loaded_weight[:, lo // 16 : (lo + per) // 16, :]
-                            if suffix == "trellis"
-                            else loaded_weight[lo : lo + per]
-                        )
-                        loaded_out = per
+                        is_full_ckpt = True
                     else:
                         raise RuntimeError(
                             f"EXL3 linear load: {suffix} tensor covers {loaded_out} outputs "
@@ -5778,7 +5797,9 @@ class Exl3LinearMethod(LinearMethodBase):
                         )
                 start = 0
                 for i in ids:
-                    size = output_partition_sizes[i]
+                    size = output_partition_sizes[i] * (
+                        tp_size if is_full_ckpt else 1
+                    )
                     if suffix == "trellis":
                         piece = loaded_weight[:, start // 16 : (start + size) // 16, :]
                     else:
