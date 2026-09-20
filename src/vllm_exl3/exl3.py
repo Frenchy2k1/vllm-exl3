@@ -3217,7 +3217,7 @@ class Exl3Config(QuantizationConfig):
 
     def _resolve_prefix_bits_from_checkpoint(
         self, prefix: str
-    ) -> int | None:
+    ) -> int | list[int] | None:
         """Per-tensor K for one linear, from the checkpoint's trellis width.
 
         Turboderp calibration packs allocate per-tensor bits (a single
@@ -3238,7 +3238,7 @@ class Exl3Config(QuantizationConfig):
 
     def _resolve_prefix_bits_uncached(
         self, prefix: str
-    ) -> int | None:
+    ) -> int | list[int] | None:
         try:
             import json
             import re
@@ -3263,11 +3263,16 @@ class Exl3Config(QuantizationConfig):
             # falling back to a plain suffix match for non-layer prefixes.
             # Merged vLLM linears map to their checkpoint tensor splits
             # (gate_up_proj ships as gate_proj + up_proj, etc.).
+            # (name, shard_span): each checkpoint tensor covers `span`
+            # consecutive output shards of the merged linear. Spans come
+            # from the model's stacked-params mapping (in_proj_qkv covers
+            # q,k,v = shards 0-2; in_proj_z covers shard 3; qkv_proj is
+            # one shard per q/k/v; gate/up are one shard each).
             merged_splits = {
-                "gate_up_proj": ("gate_proj", "up_proj"),
-                "qkv_proj": ("q_proj", "k_proj", "v_proj"),
-                "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
-                "kv_proj": ("k_proj", "v_proj"),
+                "gate_up_proj": (("gate_proj", 1), ("up_proj", 1)),
+                "qkv_proj": (("q_proj", 1), ("k_proj", 1), ("v_proj", 1)),
+                "in_proj_qkvz": (("in_proj_qkv", 3), ("in_proj_z", 1)),
+                "kv_proj": (("k_proj", 1), ("v_proj", 1)),
             }
             m = re.search(r"(?:^|\.)layers\.(\d+)\.(.+)$", prefix or "")
             if m is not None:
@@ -3277,15 +3282,21 @@ class Exl3Config(QuantizationConfig):
                 if splits is not None:
                     # Swap the merged basename for its checkpoint splits,
                     # keeping the parent path (mlp., linear_attn., ...).
+                    names = tuple(t for t, _ in splits)
                     patterns = tuple(
                         f"layers.{layer_idx}.{parent}.{t}.trellis"
-                        for t in splits
+                        for t in names
                     ) if parent else tuple(
-                        f"layers.{layer_idx}.{t}.trellis" for t in splits
+                        f"layers.{layer_idx}.{t}.trellis" for t in names
                     )
                 else:
                     patterns = (f"layers.{layer_idx}.{tail}.trellis",)
             else:
+                # Non-layer prefixes (visual.*, lm_head, ...): anchor the
+                # match on the FULL key tail — a bare substring like
+                # 'proj.trellis' would cross-match the language model's
+                # out_proj/down_proj trellis and false-claim visual
+                # linears.
                 tail = (prefix or "").rsplit(".", 1)[-1]
                 patterns = (f"{tail}.trellis",)
 
@@ -3293,7 +3304,8 @@ class Exl3Config(QuantizationConfig):
                 # mtp.layers.N.* must not match layers.N.*
                 if key.startswith("mtp."):
                     return False
-                return any(p in key for p in patterns)
+                # Dot-anchored: '_qkv.trellis' must not match 'qkv.trellis'
+                return any(key.endswith("." + p) or key == p for p in patterns)
 
             keys = [k for k in weight_map if matches(k)]
             shards: dict[str, list[str]] = {}
@@ -3318,15 +3330,37 @@ class Exl3Config(QuantizationConfig):
                 for key in shard_keys:
                     shape = header.get(key, {}).get("shape") or []
                     if len(shape) == 3 and shape[-1] % 16 == 0:
-                        resolved_ks.append(shape[-1] // 16)
-            # A merged allocation needs every matched tensor at the same K;
-            # mixed-K merged groups (e.g. q=5/k=7/v=7) cannot share one
-            # trellis width — return None and let the caller decide.
+                        # Order by which split pattern the key matched —
+                        # weight_map order interleaves q/k/v tensors, but
+                        # the caller zips the result with the merged_splits
+                        # span order.
+                        _pi = next(
+                            (
+                                i
+                                for i, p in enumerate(patterns)
+                                if key.endswith("." + p) or key == p
+                            ),
+                            len(patterns),
+                        )
+                        resolved_ks.append((shape[-1] // 16, _pi))
+            resolved_ks = [
+                k for k, _ in sorted(resolved_ks, key=lambda t: t[1])
+            ]
+            # Merged groups: the caller needs per-shard Ks. Uniform → int;
+            # mixed-K merged groups (e.g. q=5/k=7/v=7) → the ordered list,
+            # one entry per matched tensor (checkpoint order = shard order
+            # for the merged_splits mapping); no trellis at all → None.
             if resolved_ks and len(set(resolved_ks)) == 1:
                 return resolved_ks[0]
+            if resolved_ks:
+                return resolved_ks
             return None
-        except Exception:
-            pass
+        except Exception as exc:
+            import os as _os
+            if _os.environ.get("VLLM_EXL3_RESOLVER_DEBUG"):
+                import traceback
+                print(f"[exl3-resolver] {prefix!r} failed: {exc!r}", flush=True)
+                traceback.print_exc()
         return None
 
     def _resolve_indexer_bits_from_checkpoint(
@@ -3590,17 +3624,42 @@ class Exl3Config(QuantizationConfig):
                 # Per-tensor calibration packs (per-layer K spanning the
                 # global/head_bits pair) carry the real K in each trellis
                 # width; the checkpoint wins over every family heuristic.
+                # Mixed-K merged groups resolve to a per-tensor K LIST —
+                # claimed at the method-level (scalar) bits; each shard's
+                # real width comes from its own trellis tensor at load
+                # (ragged per-shard staging).
                 resolved = self._resolve_prefix_bits_from_checkpoint(prefix)
-                if resolved is not None:
+                if resolved is None:
+                    # No trellis for this prefix in the checkpoint: the
+                    # pack keeps this linear native (e.g. Qwen3-VL towers
+                    # ship raw weights). Unclaim — claiming would pad the
+                    # raw weight into EXL3 staging geometry and fail.
+                    import os as _os
+                    if _os.environ.get("VLLM_EXL3_RESOLVER_DEBUG"):
+                        print(f"[exl3-unclaim] {prefix}", flush=True)
+                    return UnquantizedLinearMethod()
+                if isinstance(resolved, int):
                     bits = resolved
                 return Exl3LinearMethod(self, bits=bits)
             if getattr(self, "non_routed_dtype_policy", "") == "bf16_as_stored":
+                import os as _os
+                if _os.environ.get("VLLM_EXL3_RESOLVER_DEBUG"):
+                    print(f"[exl3-unquant] bf16_as_stored {prefix}", flush=True)
                 return UnquantizedLinearMethod()
             d = self._non_routed_delegate()
             if d is not None:
                 m = d.get_quant_method(layer, prefix)
                 if m is not None:
                     return m
+            import os as _os
+            if _os.environ.get("VLLM_EXL3_RESOLVER_DEBUG"):
+                print(
+                    f"[exl3-unquant] delegate-miss {prefix} "
+                    f"nr_exl3={self.non_routed_exl3!r} "
+                    f"policy={getattr(self, 'non_routed_dtype_policy', '')!r} "
+                    f"matches_nr={self._matches_non_routed_exl3(prefix)}",
+                    flush=True,
+                )
             return UnquantizedLinearMethod()
         # Embedding-family layers. vLLM only consults quant_config for these when
         # the model passes it (qwen4_exp needs quant_config= on ParallelLMHead and
@@ -5567,6 +5626,7 @@ class Exl3LinearMethod(LinearMethodBase):
         layer.register_parameter("mul1", mul1_param)
         layer.register_parameter("weight", weight_param)
 
+
         # Custom weight loader
         extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
         set_weight_attrs(trellis_param, extra)
@@ -5674,7 +5734,19 @@ class Exl3LinearMethod(LinearMethodBase):
                         f"EXL3 linear: unsupported shard id span {loaded_shard_id} "
                         f"for n_shards={n_shards}"
                     )
-                if suffix in ("suh", "mcg", "mul1"):
+                if suffix == "suh":
+                    # Suh rows are per-shard input scales: the span
+                    # tensor holds each covered shard's rows
+                    # concatenated. Slice per shard — passing the FULL
+                    # tensor to every shard's write would corrupt all
+                    # but the first shard's scales.
+                    start = 0
+                    for i in ids:
+                        size = output_partition_sizes[i]
+                        weight_loader(param, loaded_weight[start : start + size], i)
+                        start += size
+                    return
+                if suffix in ("mcg", "mul1"):
                     for i in ids:
                         weight_loader(param, loaded_weight, i)
                     return
@@ -5763,6 +5835,7 @@ class Exl3LinearMethod(LinearMethodBase):
                     if tuple(dest.shape) == tuple(loaded_weight.shape):
                         dest.copy_(loaded_weight)
                         return
+
             if shard_idx >= n_shards:
                 raise ValueError(
                     f"shard_idx={shard_idx} out of range for n_shards={n_shards}; "
@@ -5802,7 +5875,8 @@ class Exl3LinearMethod(LinearMethodBase):
                         raise RuntimeError(
                             f"EXL3 weight load shape mismatch shard={shard_idx}: "
                             f"expected ({expected_out},{expected_in}) but got {tuple(loaded.shape)} "
-                            f"(after TP: {tuple(tp_sharded.shape)})"
+                            f"(after TP: {tuple(tp_sharded.shape)}); "
+                            f"prefix={getattr(layer, '_exl3_prefix', '?')}"
                         )
                     # If this shard is in bf16_shards, copy; otherwise discard
                     if shard_idx in bf16_shards:
