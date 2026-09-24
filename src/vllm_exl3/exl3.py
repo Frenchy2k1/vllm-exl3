@@ -3538,7 +3538,10 @@ class Exl3Config(QuantizationConfig):
         return None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        try:
+            from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        except ImportError:
+            RoutedExperts = ()  # fork without the RoutedExperts layer (dense-only)
         from vllm.model_executor.layers.fused_moe import FusedMoE
 
         # VL wrappers (NanoNemotronVL) construct the inner text model under a
