@@ -130,9 +130,11 @@ def test_qkv_loader_replicated_kv_heads_uses_shard_specific_tp() -> None:
     method = object.__new__(exl3.Exl3LinearMethod)
     layer = SimpleNamespace(tp_rank=7, tp_size=8)
     output_sizes = [512, 128, 128]
-    total_tiles = sum(output_sizes) // 16
-    param = torch.nn.Parameter(
-        torch.zeros(1, total_tiles, 32, dtype=torch.int16), requires_grad=False
+    layer._exl3_shard_trellis = torch.nn.ParameterList(
+        [
+            torch.nn.Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+            for _ in output_sizes
+        ]
     )
     loader = method._make_weight_loader(
         "trellis", 3, output_sizes, False, [], layer, True
@@ -141,9 +143,9 @@ def test_qkv_loader_replicated_kv_heads_uses_shard_specific_tp() -> None:
         1, 128 // 16, 32
     )
 
-    loader(param, loaded, loaded_shard_id="k")
+    loader(layer._exl3_shard_trellis[1], loaded, loaded_shard_id="k")
 
-    torch.testing.assert_close(param[:, 512 // 16 : (512 + 128) // 16], loaded)
+    torch.testing.assert_close(layer._exl3_shard_trellis[1], loaded)
 
     svh = torch.nn.Parameter(
         torch.zeros(sum(output_sizes), dtype=torch.float16), requires_grad=False

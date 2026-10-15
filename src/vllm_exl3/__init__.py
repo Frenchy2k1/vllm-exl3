@@ -72,6 +72,12 @@ def register() -> None:
     # The shim is idempotent, so plugin auto-discovery may safely call it again.
     install_mixed_bf16_madv_compat(exl3)
 
+    # Standalone-saved NemotronH VL packs (text model saved under backbone.*
+    # instead of language_model.backbone.*) need the name-rewriting loader.
+    # Importing registers the load format; runs are started with
+    # --load-format exl3_standalone_nemotron.
+    from . import loader_shim  # noqa: F401
+
 
 def runtime_diagnostics():
     """Return effective EXL3 runtime policy and extension availability."""

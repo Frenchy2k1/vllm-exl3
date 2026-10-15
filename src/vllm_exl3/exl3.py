@@ -114,6 +114,10 @@ try:
 except (TypeError, ValueError):
     FAT_EXPERT_THRESHOLD = 256
 MOE_ACT_SILU = 0
+# Non-gated relu2 (NemotronH): the gate GEMM is skipped by the kernel; the gate
+# lane is set to relu(u) so the gate multiply yields relu(u) * u = relu^2(u)
+# exactly (exllamav3 hadamard_inner.cuh ACT_RELU2_NOGATE).
+MOE_ACT_RELU2_NOGATE = 2
 # Shared fused scratch: decode is sequential across layers.
 _FUSED_TEMP_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
@@ -645,19 +649,39 @@ def _try_prescan_trellis_shapes(
         or 0
     )
     # EP linear placement: local e <-> global offset+e
-    prefix = f"layers.{layer_id}.ffn.experts."
+    # NemotronH packs store experts under ...mixer.experts (up/down only,
+    # gateless relu2); the historical layout is ...ffn.experts (gate/up/down).
+    base_name = layer_name
+    for cand in ("ffn.experts", "mixer.experts"):
+        if cand in base_name:
+            prefix = f"layers.{layer_id}.{cand}."
+            break
+    else:
+        prefix = f"layers.{layer_id}.ffn.experts."
+    gateless = moe_layer_is_gateless(layer)
+    # Checkpoint-side names: the historical layout stores gate/up/down as
+    # w1/w3/w2; NemotronH stores up_proj/down_proj (no gate). vLLM maps both
+    # onto shard ids w1/w3/w2 at load time; the prescan reads the raw index.
+    ckpt_names = {"up": "up_proj", "down": "down_proj"} if gateless else {
+        "gate": "w1", "up": "w3", "down": "w2",
+    }
     shapes: dict[str, dict[int, tuple[int, ...]]] = {
         "gate": {},
         "up": {},
         "down": {},
     }
-    proj_map = {"w1": "gate", "w3": "up", "w2": "down"}
-    # Gather keys per local expert.
+    # Gather keys per local expert. Standalone-saved packs keep the raw
+    # `backbone.` prefix on disk (the loader shim rewrites names only in the
+    # streaming iterator), so accept both raw prefix forms.
     for local_e in range(int(num_experts)):
         global_e = offset + local_e
-        for wp, proj in proj_map.items():
-            key = f"{prefix}{global_e}.{wp}.trellis"
-            shard = weight_map.get(key)
+        for proj, ckpt_name in ckpt_names.items():
+            shard = None
+            for raw_prefix in ("", "backbone."):
+                key = f"{raw_prefix}{prefix}{global_e}.{ckpt_name}.trellis"
+                shard = weight_map.get(key)
+                if shard is not None:
+                    break
             if shard is None:
                 return None  # incomplete map; fall back to stage-pack
             path = os.path.join(model_dir, shard)
@@ -1351,6 +1375,36 @@ def fused_moe_enabled() -> bool:
     return os.environ.get("EXL3_FUSED_MOE", "1") != "0"
 
 
+def resolve_moe_act(layer: torch.nn.Module) -> int:
+    """Kernel activation index for this layer, from vLLM's MoE activation.
+
+    vLLM 0.31.0 exposes ``layer.moe_config.activation`` as a ``MoEActivation``
+    enum. Gated activations (silu/gelu/...) keep the historical SILU index 0.
+    Non-gated relu2 (``relu2_no_mul``, NemotronH) maps to the fork's
+    ``ACT_RELU2_NOGATE`` so the fused kernels skip the gate GEMM and compute
+    relu(u) * u = relu^2(u) exactly. Any other non-gated activation has no
+    kernel instance and must not take the fused path.
+    """
+    act = getattr(getattr(layer, "moe_config", None), "activation", None)
+    value = getattr(act, "value", None)
+    if value is None:
+        return MOE_ACT_SILU
+    if value == "relu2_no_mul":
+        return MOE_ACT_RELU2_NOGATE
+    if value.endswith("_no_mul"):
+        raise ValueError(
+            f"EXL3 fused MoE has no kernel instance for non-gated activation {value!r}"
+        )
+    return MOE_ACT_SILU
+
+
+def moe_layer_is_gateless(layer: torch.nn.Module) -> bool:
+    """Whether this layer's experts are non-gated (no gate projection at all)."""
+    act = getattr(getattr(layer, "moe_config", None), "activation", None)
+    value = getattr(act, "value", None)
+    return bool(value) and bool(value.endswith("_no_mul"))
+
+
 def load_exllamav3_ext():
     import exllamav3_ext
 
@@ -1411,6 +1465,24 @@ def _exl3_moe_accepts_num_active(fn) -> bool:
         pass
     doc = getattr(fn, "__doc__", None) or ""
     return "num_active" in doc or "arg29" in doc or doc.count("arg") >= 30
+
+
+def _exl3_mixedk_grouped_default() -> bool:
+    """Whether per-K-group dispatch is the default for this device.
+
+    The unified exl3_moe_mixedk kernel hits an illegal memory access on
+    GB10 (sm_121) at layer 23 of the NemotronH pack; the per-K-group
+    uniform-K launches (the fork's EXL3_MIXEDK_LEGACY path, measured 392
+    tok/s prefill) are the qualified route there. On every other device the
+    unified kernel keeps its historical default.
+    """
+    if not (_TORCH_AVAILABLE and torch is not None and torch.cuda.is_available()):
+        return False
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return False
+    return (major, minor) == (12, 1)
 
 
 # Positional arity of exllamav3's exl3_moe binding by release. The binding has no
@@ -1529,6 +1601,9 @@ def apply_exl3_python_loop(
     if out is None:
         out = torch.zeros(tokens, hidden, dtype=torch.float32, device=x2d.device)
     local_ids = map_topk_to_local(ids, len(inners), expert_map).reshape_as(ids)
+    gateless = any(
+        pack.get("gate") is None for pack in inners[:1]
+    ) if inners else False
     for raw in torch.unique(local_ids).tolist():
         e = int(raw)
         if e >= len(inners):
@@ -1538,12 +1613,19 @@ def apply_exl3_python_loop(
         token_idx, k_pos = (local_ids == e).nonzero(as_tuple=True)
         h = x2d.index_select(0, token_idx)
         pack = inners[e]
-        gate = pack["gate"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
-        up = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
-        if limit is not None and limit > 0:
-            gate = gate.clamp(max=limit)
-            up = up.clamp(min=-limit, max=limit)
-        act = F.silu(gate) * up
+        if gateless:
+            # Non-gated relu2: no gate projection exists; relu(u) * u = relu^2(u).
+            up_out = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
+            if limit is not None and limit > 0:
+                up_out = up_out.clamp(min=-limit, max=limit)
+            act = torch.square(torch.relu(up_out))
+        else:
+            gate = pack["gate"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
+            up = pack["up"].forward(h.contiguous().half(), {}, out_dtype=torch.float32)
+            if limit is not None and limit > 0:
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            act = F.silu(gate) * up
         down = pack["down"].forward(act.contiguous().half(), {}, out_dtype=torch.float32)
         scale = weights[token_idx, k_pos].unsqueeze(-1).to(dtype=torch.float32)
         out.index_add_(0, token_idx, down * scale)
@@ -1562,15 +1644,25 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
 
     device = layer.w13_suh.device
     n_exp = len(inners)
-    # Gate/up input rotations are immutable after load. Cache this compatibility
-    # fact once so fat-prefill dispatch never calls torch.equal on CUDA tensors
-    # in the per-expert hot loop.
-    for pack in inners:
-        pack["_exl3_gate_up_shared_suh"] = bool(
-            torch.equal(pack["gate"].suh, pack["up"].suh)
-        )
+    gateless = moe_layer_is_gateless(layer) or all(
+        pack.get("gate") is None for pack in inners
+    )
+    if gateless and any(pack.get("gate") is not None for pack in inners):
+        raise ValueError("EXL3 gateless layer must not carry gate projections")
     hidden = int(layer._exl3_hidden_size)
     intermediate = int(layer._exl3_intermediate_local)
+
+    # Gate/up input rotations are immutable after load. Cache this compatibility
+    # fact once so fat-prefill dispatch never calls torch.equal on CUDA tensors
+    # in the per-expert hot loop. Gateless packs have no gate projection; the
+    # aliasing below already guarantees the shared-suh property.
+    for pack in inners:
+        if gateless:
+            pack["_exl3_gate_up_shared_suh"] = True
+        else:
+            pack["_exl3_gate_up_shared_suh"] = bool(
+                torch.equal(pack["gate"].suh, pack["up"].suh)
+            )
 
     def _ptrs(which: str, attr: str) -> torch.Tensor:
         return torch.tensor(
@@ -1580,9 +1672,9 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         )
 
     layer._exl3_ptrs = {
-        "gate_trellis": _ptrs("gate", "trellis"),
-        "gate_suh": _ptrs("gate", "suh"),
-        "gate_svh": _ptrs("gate", "svh"),
+        "gate_trellis": _ptrs("up", "trellis") if gateless else _ptrs("gate", "trellis"),
+        "gate_suh": _ptrs("up", "suh") if gateless else _ptrs("gate", "suh"),
+        "gate_svh": _ptrs("up", "svh") if gateless else _ptrs("gate", "svh"),
         "up_trellis": _ptrs("up", "trellis"),
         "up_suh": _ptrs("up", "suh"),
         "up_svh": _ptrs("up", "svh"),
@@ -1590,6 +1682,7 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         "down_suh": _ptrs("down", "suh"),
         "down_svh": _ptrs("down", "svh"),
     }
+    layer._exl3_gateless = gateless
     # Short aliases match the native extension terminology and keep the table
     # ABI stable for callers that construct their own RoutedExperts wrapper.
     layer._exl3_ptrs.update(
@@ -1634,10 +1727,18 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         # Per-expert K arrays for exl3_moe_mixedk; scalar _exl3_k is invalid.
         layer._exl3_k = None
         layer._exl3_mixedk_unified = True
-        k_gate = torch.tensor(
-            [int(pack["gate"].trellis.shape[-1]) // 16 for pack in inners],
-            dtype=torch.int32,
-            device=device,
+        k_gate = (
+            torch.tensor(
+                [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
+                dtype=torch.int32,
+                device=device,
+            )
+            if gateless
+            else torch.tensor(
+                [int(pack["gate"].trellis.shape[-1]) // 16 for pack in inners],
+                dtype=torch.int32,
+                device=device,
+            )
         )
         k_up = torch.tensor(
             [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
@@ -1652,9 +1753,23 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         layer._exl3_K_gate_arr = k_gate
         layer._exl3_K_up_arr = k_up
         layer._exl3_K_down_arr = k_down
+        # Per-K-group dispatch (the GB10-qualified path): experts bucketed by
+        # their (K_gate, K_up, K_down) tuple; each bucket runs one uniform-K
+        # exl3_moe launch. The unified mixedk kernel is known to fault on
+        # sm_121 (GB10) at layer 23; grouped dispatch avoids it entirely.
+        groups: dict[tuple[int, int, int], list[int]] = {}
+        for e, pack in enumerate(inners):
+            kg = int(k_gate[e].item())
+            ku = int(k_up[e].item())
+            kd = int(k_down[e].item())
+            groups.setdefault((kg, ku, kd), []).append(e)
+        layer._exl3_k_groups = [
+            (k_tuple, ids) for k_tuple, ids in sorted(groups.items())
+        ]
     else:
         layer._exl3_k = int(layer._exl3_bits)
         layer._exl3_mixedk_unified = False
+        layer._exl3_k_groups = None
 
 
 def _native_moe_dimensions_supported(
@@ -1932,6 +2047,9 @@ def apply_exl3_batched_fat(
         gate = inners[e]["gate"]
         up = inners[e]["up"]
         down = inners[e]["down"]
+        gateless = gate is None
+        if gateless:
+            gate = up  # gate slots alias up; the gate GEMM is skipped below
         scratch = _fat_scratch(xh.device, n_rows, gate)
         intermediate = int(gate.out_features)
 
@@ -1956,21 +2074,34 @@ def apply_exl3_batched_fat(
         svh13[:intermediate].copy_(gate.svh)
         svh13[intermediate:].copy_(up.svh)
 
-        k = int(getattr(gate, "K", 4))
-        mcg = bool(getattr(gate, "mcg", True))
-        mul1 = bool(getattr(gate, "mul1", False))
+        # Per-projection physical K: mixed-K packs carry different K per
+        # projection (e.g. NemotronH up-K4/down-K5). The w13 side must use the
+        # up width and the down side the down width; a single scalar K is only
+        # valid for uniform-K layers.
+        k_gate = int(getattr(gate, "K", 4))
+        k_up = int(getattr(up, "K", k_gate))
+        k_down = int(getattr(down, "K", k_up))
+        if not gateless and (k_gate != k_up):
+            raise RuntimeError(
+                "EXL3 fat path requires equal gate/up K; got "
+                f"gate K={k_gate} up K={k_up}"
+            )
+        mcg_up = bool(getattr(gate, "mcg", True))
+        mul1_up = bool(getattr(gate, "mul1", False))
+        mcg_down = bool(getattr(down, "mcg", mcg_up))
+        mul1_down = bool(getattr(down, "mul1", mul1_up))
 
         if (
             not distinct_suh
             and use_kernel
-            and k == 4
-            and mcg
-            and not mul1
+            and k_up == 4
+            and mcg_up
+            and not mul1_up
             and native_c is not None
             and hasattr(native_c, "exl3_fat_gemm")
         ):
             native_c.exl3_fat_gemm(
-                h13, packed13, gate_up, svh13, k, mcg, mul1
+                h13, packed13, gate_up, svh13, k_up, mcg_up, mul1_up
             )
         else:
             if distinct_suh:
@@ -1980,8 +2111,8 @@ def apply_exl3_batched_fat(
                 ext.had_r_128(up_h, up_h, up.suh, None, 1.0)
                 w_gate = scratch["w_gate"]
                 w_up = scratch["w_up"]
-                ext.reconstruct(w_gate, gate.trellis, k, mcg, mul1)
-                ext.reconstruct(w_up, up.trellis, k, mcg, mul1)
+                ext.reconstruct(w_gate, gate.trellis, k_gate, mcg_up, mul1_up)
+                ext.reconstruct(w_up, up.trellis, k_up, mcg_up, mul1_up)
                 # Contiguous temporaries: ext.hgemm / ext.had_r_128 read and
                 # write row-major contiguous matrices, and a column slice of
                 # ``gate_up`` is neither (see patch_fat_distinct).
@@ -1993,7 +2124,7 @@ def apply_exl3_batched_fat(
                 ext.had_r_128(u_tmp, u_tmp, None, up.svh, 1.0)
             else:
                 w13 = scratch["w13"]
-                ext.reconstruct(w13, packed13, k, mcg, mul1)
+                ext.reconstruct(w13, packed13, k_up, mcg_up, mul1_up)
                 ext.hgemm(h13, w13, gate_up)
                 ext.had_r_128(gate_up, gate_up, None, svh13, 1.0)
 
@@ -2007,8 +2138,15 @@ def apply_exl3_batched_fat(
             gate_out.clamp_(max=limit)
             up_out.clamp_(min=-limit, max=limit)
         act = scratch["act"][:n_rows]
-        torch.sigmoid(gate_out, out=act)
-        act.mul_(gate_out).mul_(up_out)
+        if gateless:
+            # Non-gated relu2: relu(up) * up = relu^2(up); no gate lane.
+            # torch.relu takes no out= argument; write through the scratch view.
+            torch.nn.functional.relu(up_out, inplace=True)
+            act.copy_(up_out)
+            act.mul_(up_out)
+        else:
+            torch.sigmoid(gate_out, out=act)
+            act.mul_(gate_out).mul_(up_out)
         act_h = scratch["act_h"][:n_rows]
         act_h.copy_(act)
 
@@ -2017,9 +2155,9 @@ def apply_exl3_batched_fat(
         if (
             not distinct_suh
             and use_kernel
-            and k == 4
-            and mcg
-            and not mul1
+            and k_down == 4
+            and mcg_down
+            and not mul1_down
             and native_c is not None
             and hasattr(native_c, "exl3_fat_gemm_scatter")
         ):
@@ -2030,13 +2168,13 @@ def apply_exl3_batched_fat(
                 down.svh,
                 token_idx,
                 weight_sorted[start:offset],
-                k,
-                mcg,
-                mul1,
+                k_down,
+                mcg_down,
+                mul1_down,
             )
         else:
             w2 = scratch["w2"]
-            ext.reconstruct(w2, down.trellis, k, mcg, mul1)
+            ext.reconstruct(w2, down.trellis, k_down, mcg_down, mul1_down)
             down_out = scratch["down"][:n_rows]
             ext.hgemm(h2, w2, down_out)
             ext.had_r_128(down_out, down_out, None, down.svh, 1.0)
@@ -2141,9 +2279,12 @@ def apply_exl3_fused_moe(
     # single-stream speculation and light-concurrency traffic. Larger batches and
     # fat routes fall through to the stock path below.
     # Mixed-K layers skip coop and use the mixedk kernel instead.
+    # Gateless (relu2) layers also skip coop: the cooperative kernels implement
+    # the gated silu/gelu pair only.
     if (
         _COOP
         and not is_mixedk
+        and not getattr(layer, "_exl3_gateless", False)
         and tokens * topk <= 256
         and hasattr(exllamav3_ext, "exl3_moe_coop")
         and not (fat_possible and bool(fat.any().item()))
@@ -2210,9 +2351,90 @@ def apply_exl3_fused_moe(
     fn = exllamav3_ext.exl3_moe
     # -1 = unknown active count: max-concurrency grid, no .item() host sync.
     n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
+    moe_act = getattr(layer, "_exl3_moe_act", None)
+    if moe_act is None:
+        moe_act = resolve_moe_act(layer)
 
     if is_mixedk and hasattr(exllamav3_ext, "exl3_moe_mixedk"):
-        # Mixed-K fused dispatch: per-expert K arrays instead of scalar K.
+        k_groups = getattr(layer, "_exl3_k_groups", None)
+        mode = os.environ.get("VLLM_EXL3_MIXEDK_MODE", "").strip().lower()
+        grouped_default = _exl3_mixedk_grouped_default()
+        use_grouped = (k_groups is not None) and (mode != "unified") and (
+            mode == "grouped" or grouped_default
+        )
+        if use_grouped:
+            # Per-K-group dispatch (GB10-qualified): one uniform-K exl3_moe
+            # launch per distinct (K_gate, K_up, K_down) tuple. The unified
+            # mixedk kernel faults on sm_121 (illegal memory access at layer
+            # 23); this path never touches it.
+            gateless = bool(getattr(layer, "_exl3_gateless", False))
+            for (kg, ku, kd), ids in k_groups:
+                grp_mask = torch.isin(standard_local, torch.as_tensor(
+                    ids, device=standard_local.device, dtype=standard_local.dtype
+                ))
+                if not bool(grp_mask.any().item()):
+                    continue
+                grp_local = torch.where(grp_mask, standard_local, n_exp)
+                grp_weight = torch.where(grp_mask, standard_weight, torch.zeros_like(standard_weight))
+                grp_order = grp_local.argsort()
+                grp_token_sorted = flat_token[grp_order]
+                grp_weight_sorted = grp_weight[grp_order]
+                grp_count = torch.zeros(
+                    n_exp + 1, dtype=torch.long, device=grp_local.device
+                )
+                grp_count.scatter_add_(
+                    0,
+                    grp_local.long(),
+                    torch.ones(grp_local.shape, dtype=torch.long, device=grp_local.device),
+                )
+                args_grp = (
+                    xh,
+                    out,
+                    grp_count,
+                    grp_token_sorted,
+                    grp_weight_sorted,
+                    temps[0],
+                    temps[1],
+                    temps[2],
+                    temps[3],
+                    moe_act,
+                    float(kg),
+                    float(ku),
+                    float(kd),
+                    ptrs["gate_trellis"],
+                    ptrs["gate_suh"],
+                    ptrs["gate_svh"],
+                    ptrs["up_trellis"],
+                    ptrs["up_suh"],
+                    ptrs["up_svh"],
+                    ptrs["down_trellis"],
+                    ptrs["down_suh"],
+                    ptrs["down_svh"],
+                    *getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS),
+                    float(limit) if (limit is not None and limit > 0) else 0.0,
+                )
+                tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
+                if tail and n_active_host is None:
+                    n_active_host = -1
+                if n_active_host is not None:
+                    fn(*args_grp, n_active_host, *tail)
+                else:
+                    fn(*args_grp)
+            if fat_possible and bool(fat.any().item()):
+                fat_order = local.argsort()
+                apply_exl3_batched_fat(
+                    xh,
+                    flat_token[fat_order],
+                    flat_weight[fat_order],
+                    counts.tolist(),
+                    inners,
+                    limit,
+                    FAT_EXPERT_THRESHOLD,
+                    out,
+                    use_kernel=_fat_kernel_available(),
+                )
+            return out
+        # Unified mixed-K fused dispatch: per-expert K arrays instead of scalar K.
         fn_mk = exllamav3_ext.exl3_moe_mixedk
         args_mk = (
             xh,
@@ -2224,7 +2446,7 @@ def apply_exl3_fused_moe(
             temps[1],
             temps[2],
             temps[3],
-            MOE_ACT_SILU,
+            moe_act,
             layer._exl3_K_gate_arr,
             layer._exl3_K_up_arr,
             layer._exl3_K_down_arr,
@@ -2260,7 +2482,7 @@ def apply_exl3_fused_moe(
             temps[1],
             temps[2],
             temps[3],
-            MOE_ACT_SILU,
+            moe_act,
             k,
             k,
             k,
@@ -2401,6 +2623,89 @@ def _prefix_has_suffix(prefix: str, suffix: str) -> bool:
     """Module-path suffix match: "self_attn.o_proj" matches
     "model.layers.3.self_attn.o_proj" but not "...cross_attn.o_proj_x"."""
     return prefix == suffix or prefix.endswith("." + suffix)
+
+
+def _derive_non_routed_from_tensor_storage(
+    tensor_storage: Any,
+) -> dict[str, Any] | None:
+    """Build a non_routed_exl3 block from the pack's tensor_storage ledger.
+
+    Every EXL3-format prefix that is not a routed-experts prefix becomes a
+    layers entry with its own bits. Routed experts (any prefix whose key
+    contains ".experts.") are handled by Exl3MoEMethod and are excluded.
+    Dense-format prefixes are excluded (they stay on the native path).
+    """
+    if not isinstance(tensor_storage, dict) or not tensor_storage:
+        return None
+    layers: dict[str, dict[str, Any]] = {}
+    codebook = None
+    for prefix, spec in tensor_storage.items():
+        if not isinstance(spec, dict):
+            continue
+        if str(spec.get("quant_format", "")) != "exl3":
+            continue
+        if ".experts." in str(prefix):
+            continue
+        bits = spec.get("bits_per_weight")
+        try:
+            bits = int(bits)
+        except (TypeError, ValueError):
+            continue
+        if not 2 <= bits <= 8:
+            continue
+        # Checkpoint names use the HF prefix (backbone.*); vLLM's weight
+        # mapper renames backbone->model before get_quant_method sees the
+        # prefix, so normalize the derived key to the post-mapper form.
+        key = str(prefix)
+        if key.startswith("backbone."):
+            key = "model." + key[len("backbone."):]
+        layers[key] = {"bits": bits}
+        if codebook is None and "mul1_multiplier" in spec:
+            codebook = "mul1"
+    if not layers:
+        return None
+    # vLLM's WeightsMapper stacks q/k/v into one fused qkv_proj layer, so the
+    # prefix that reaches get_quant_method is the fused name. Add it wherever
+    # all three component projections are EXL3-quantized; the per-shard K is
+    # read from each shard's own trellis at load, so the recorded bits value
+    # (the max of the three) is only the config-level default.
+    fused_added: dict[str, dict[str, Any]] = {}
+    for key in list(layers.keys()):
+        m = re.search(r"^(.*)\.q_proj$", key)
+        if not m:
+            continue
+        base = m.group(1)
+        if f"{base}.k_proj" in layers and f"{base}.v_proj" in layers:
+            fused = f"{base}.qkv_proj"
+            max_bits = max(
+                int(layers[f"{base}.{p}"]["bits"]) for p in ("q_proj", "k_proj", "v_proj")
+            )
+            fused_added[fused] = {"bits": max_bits}
+    layers.update(fused_added)
+    return {"layers": layers, "codebook": codebook or "mcg"}
+
+
+def _read_sidecar_tensor_storage() -> Any:
+    """The tensor_storage ledger from the pack's sidecar quantization_config.json.
+
+    Some packs embed only the public card in config.json and keep the full
+    per-tensor ledger in a sibling quantization_config.json next to the
+    weights. vLLM hands from_config the parsed embedded block only, so the
+    model directory must be declared explicitly with VLLM_EXL3_MODEL_DIR.
+    """
+    env = os.environ.get("VLLM_EXL3_MODEL_DIR", "")
+    if not env:
+        return None
+    path = os.path.join(env, "quantization_config.json")
+    try:
+        if not os.path.isfile(path):
+            return None
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    ts = data.get("tensor_storage")
+    return ts if isinstance(ts, dict) and ts else None
 
 
 @register_quantization_config("exl3")
@@ -2625,6 +2930,26 @@ class Exl3Config(QuantizationConfig):
         # layer index>; those layers delegate to non_routed_quantization.
         inst.mtp_experts = str(config.get("mtp_experts", "exl3"))
         inst.mtp_experts_start_layer = config.get("mtp_experts_start_layer")
+        # Packs without an explicit non_routed_exl3 block (NemotronH): derive
+        # the non-routed EXL3 coverage from the tensor_storage ledger so the
+        # attention/mamba/shared/lm_head linears route to Exl3LinearMethod.
+        # The ledger itself stays off the config object (skip set above).
+        # Some packs keep the ledger only in a sidecar quantization_config.json
+        # next to the weights (the embedded block is just the public card);
+        # fall back to that file when the embedded block has no ledger.
+        if not inst.non_routed_exl3:
+            ts = config.get("tensor_storage")
+            if not isinstance(ts, dict) or not ts:
+                ts = _read_sidecar_tensor_storage()
+            derived = _derive_non_routed_from_tensor_storage(ts)
+            if derived:
+                inst.non_routed_exl3 = derived
+                logger.info(
+                    "EXL3 derived non-routed coverage from tensor_storage: "
+                    "%d module prefixes, codebook=%s",
+                    len(derived.get("layers", {})),
+                    derived.get("codebook"),
+                )
         return inst
 
     @classmethod
@@ -2652,6 +2977,15 @@ class Exl3Config(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+        # VL wrappers (NanoNemotronVL) construct the inner text model under a
+        # `language_model` prefix and strip that prefix again at load time
+        # (load_weights yields name.split(".")[1:]), so construction-time
+        # queries arrive wrapper-prefixed while non_routed coverage keys are
+        # inner-relative. Normalize the query the same way the wrapper's load
+        # path does so both sides agree.
+        if prefix.startswith("language_model."):
+            prefix = prefix[len("language_model.") :]
 
         if isinstance(layer, RoutedExperts):
             # Draft/MTP blocks construct with plain layers.N prefixes (the
@@ -3091,6 +3425,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         owner_mod = owner if owner is not None else getattr(param, "_exl3_owner", None)
         tp_rank, tp_size = _resolve_tp_geometry(owner_mod, param)
+        # Non-gated MoE (NemotronH): upstream maps the checkpoint's up_proj onto
+        # shard w1 and never sends w3 (ckpt_up_proj_name=""). The up payload
+        # must land in UP storage; build_exl3_fused_state later aliases up
+        # pointer tables into the gate slots for the kernel. Remap w1->w3 for
+        # gateless layers so every branch below (mixed store, markers, trellis,
+        # scales) addresses the up slot and gate storage stays empty.
+        if shard_id == "w1" and owner_mod is not None and moe_layer_is_gateless(
+            owner_mod
+        ):
+            shard_id = "w3"
+        if os.environ.get("VLLM_EXL3_LOG_MOE_ROUTING"):
+            print(
+                f"[exl3-load] weight_name={weight_name!r} shard_id={shard_id!r} "
+                f"expert_id={expert_id} suffix={_suffix_from_mapped_name(weight_name)!r}",
+                flush=True,
+            )
         if tp_size > 1 and getattr(owner_mod, "_exl3_tp_rotation", 0):
             # Same per-layer chunk rotation as create_weights (memory balance).
             tp_rank = (tp_rank + owner_mod._exl3_tp_rotation) % tp_size
@@ -3361,10 +3711,37 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             for param in plist:
                 param._exl3_owner = layer
                 param.weight_loader = self._load_exl3
-        _check_moe_codebook_markers(layer.w13_mcg, layer.w13_mul1, "w13")
         _check_moe_codebook_markers(layer.w2_mcg, layer.w2_mul1, "w2")
+        if moe_layer_is_gateless(layer):
+            # Non-gated layer: w13 lane 0 (gate) is never loaded; only the up
+            # lane may carry a codebook marker.
+            mcg_v = layer.w13_mcg.reshape(-1)
+            mul1_v = layer.w13_mul1.reshape(-1)
+            gate_mcg = mcg_v[0::2]
+            gate_mul1 = mul1_v[0::2]
+            up_mcg = mcg_v[1::2]
+            up_mul1 = mul1_v[1::2]
+            if bool((gate_mcg != 0).any()) or bool((gate_mul1 != 0).any()):
+                raise RuntimeError(
+                    "EXL3 gateless w13: gate lane must stay empty (no gate projection)"
+                )
+            if bool(((up_mcg != 0) & (up_mul1 != 0)).any()) or bool(
+                ((up_mcg == 0) & (up_mul1 == 0)).any()
+            ):
+                raise RuntimeError(
+                    "EXL3 gateless w13: every up lane must carry exactly one codebook marker"
+                )
+            if bool((up_mcg[up_mcg != 0] != MCG_MARKER_SIGNED_INT32).any()) or bool(
+                (up_mul1[up_mul1 != 0] != MUL1_MARKER_SIGNED_INT32).any()
+            ):
+                raise RuntimeError("EXL3 gateless w13: up-lane marker ABI mismatch")
+        else:
+            _check_moe_codebook_markers(layer.w13_mcg, layer.w13_mul1, "w13")
 
         n_exp = int(len(layer.gate_trellis))
+        gateless = moe_layer_is_gateless(layer)
+        layer._exl3_moe_act = resolve_moe_act(layer)
+        layer._exl3_gateless = gateless
         inners: list[dict[str, Any]] = []
         k_values: list[int] = []
         # _BATCHED_MARKERS: prefetch every marker block once (4 host
@@ -3378,11 +3755,40 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             gt = layer.gate_trellis[e]
             ut = layer.up_trellis[e]
             dt = layer.down_trellis[e]
-            if gt.numel() == 0 or ut.numel() == 0 or dt.numel() == 0:
+            if (ut.numel() == 0 or dt.numel() == 0) or (
+                not gateless and gt.numel() == 0
+            ):
                 raise RuntimeError(
                     f"EXL3 mixed-K load incomplete for local expert {e}: "
                     f"gate={tuple(gt.shape)} up={tuple(ut.shape)} down={tuple(dt.shape)}"
                 )
+            if gateless:
+                # Non-gated layer: no gate projection exists in the checkpoint
+                # (vLLM maps only up_proj/down_proj). The up module stands in
+                # wherever a gate slot is expected and is never dereferenced
+                # by the kernel (ACT_RELU2_NOGATE skips the gate GEMM).
+                up = make_linear_exl3(
+                    ut,
+                    layer.w13_suh[e, 1],
+                    layer.w13_svh[e, 1],
+                    _marker_tensor_or_none_host(w13_mcg_h, e * w13_ncol + 1, ut.device),
+                    _marker_tensor_or_none_host(w13_mul1_h, e * w13_ncol + 1, ut.device),
+                )
+                down = make_linear_exl3(
+                    dt,
+                    layer.w2_suh[e],
+                    layer.w2_svh[e],
+                    _marker_tensor_or_none_host(w2_mcg_h, e, dt.device),
+                    _marker_tensor_or_none_host(w2_mul1_h, e, dt.device),
+                )
+                inners.append({"gate": None, "up": up, "down": down})
+                k_values.extend(
+                    [
+                        int(ut.shape[-1]) // 16,
+                        int(dt.shape[-1]) // 16,
+                    ]
+                )
+                continue
             gate = make_linear_exl3(
                 gt,
                 layer.w13_suh[e, 0],
@@ -3416,19 +3822,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         mixed_k = len(set(k_values)) > 1
         layer._exl3_mixed_k = mixed_k
         # Codebook flags (mcg, mul1) per projection for the fused kernel launch;
-        # every expert in a layer must agree.
+        # every expert in a layer must agree. Gateless layers have no gate
+        # projection: the up module's flags stand in for the gate slots (the
+        # kernel never dereferences them).
         if inners:
-            flags = tuple(
-                bool(getattr(inners[0][w], a, d))
-                for w in ("gate", "up", "down")
-                for a, d in (("mcg", True), ("mul1", False))
-            )
-            for e, inner in enumerate(inners):
-                f_e = tuple(
-                    bool(getattr(inner[w], a, d))
+            def _flag_pack(inner: dict) -> tuple:
+                src = inner if inner.get("gate") is not None else {
+                    "gate": inner["up"], "up": inner["up"], "down": inner["down"],
+                }
+                return tuple(
+                    bool(getattr(src[w], a, d))
                     for w in ("gate", "up", "down")
                     for a, d in (("mcg", True), ("mul1", False))
                 )
+            flags = _flag_pack(inners[0])
+            for e, inner in enumerate(inners):
+                f_e = _flag_pack(inner)
                 if f_e != flags:
                     raise RuntimeError(
                         f"EXL3 experts disagree on codebook: expert {e} {f_e} vs expert 0 {flags}"
@@ -3889,7 +4298,7 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
             _check_ngram_disk_graph_mode()
         layer._exl3_ngram_head_offsets = layer.head_offsets.data.contiguous()
         layer._exl3_ngram_head_bias = layer.head_bias.data.contiguous()
-        layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "ngram")
+        layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "ngram", self)
         if self.kernel == "ext":
             ext = load_exllamav3_ext()
             if hasattr(ext, "ngram_dequant"):
@@ -4003,10 +4412,13 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
 # ---------------------------------------------------------------------------
 
 _EXL3_OPAQUE_LAYERS: dict[str, Any] = {}
+_EXL3_OPAQUE_METHODS: dict[str, Any] = {}
 _EXL3_OPS_READY = False
 
 
-def _exl3_register_opaque_layer(layer: torch.nn.Module, kind: str) -> str:
+def _exl3_register_opaque_layer(
+    layer: torch.nn.Module, kind: str, method: Any = None
+) -> str:
     stable = (
         getattr(layer, "_exl3_prefix", None)
         or getattr(layer, "prefix", None)
@@ -4015,12 +4427,22 @@ def _exl3_register_opaque_layer(layer: torch.nn.Module, kind: str) -> str:
     )
     name = f"exl3_{kind}:{stable}"
     _EXL3_OPAQUE_LAYERS[name] = layer
+    # The owning method instance serves the op. Bind it at registration time:
+    # vLLM layers expose it as .quant_method, but bare test Modules and custom
+    # runners do not, and the attribute can be swapped after registration.
+    if method is None:
+        method = getattr(layer, "quant_method", None)
+    if method is not None:
+        _EXL3_OPAQUE_METHODS[name] = method
     return name
 
 
 def _exl3_linear_forward_op(x: torch.Tensor, layer_name: str) -> torch.Tensor:
     layer = _EXL3_OPAQUE_LAYERS[layer_name]
-    return layer.quant_method._apply_impl(layer, x)
+    method = _EXL3_OPAQUE_METHODS.get(layer_name)
+    if method is None:
+        method = layer.quant_method
+    return method._apply_impl(layer, x)
 
 
 def _exl3_linear_forward_fake(x: torch.Tensor, layer_name: str) -> torch.Tensor:
@@ -4267,10 +4689,20 @@ class Exl3LinearMethod(LinearMethodBase):
         out_tiles_list = [s // 16 for s in output_partition_sizes]
         total_out_tiles = sum(out_tiles_list)
 
-        # Allocate fused trellis covering all shards (dim1 will be narrow per-shard)
+        # Ragged per-shard trellis staging: shards may carry different K
+        # (NemotronH qkv: q K4/5 vs k/v K6-8), so the payload cannot live in
+        # one fused fixed-width tensor. The registered ``trellis`` param is a
+        # name-resolution dummy (the loader routes to the per-shard slots);
+        # exact-shape tensors are allocated on load, as in the MoE path.
         trellis_param = Parameter(
-            torch.empty(in_tiles, total_out_tiles, k_words, dtype=torch.int16),
+            torch.empty(in_tiles, 0, k_words, dtype=torch.int16),
             requires_grad=False,
+        )
+        layer._exl3_shard_trellis = torch.nn.ParameterList(
+            [
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+                for _ in range(n_shards)
+            ]
         )
         # Per-shard suh (one per shard, each covers this rank's input partition)
         suh_param = Parameter(
@@ -4533,10 +4965,20 @@ class Exl3LinearMethod(LinearMethodBase):
 
             # Copy into the right location
             if suffix == "trellis":
-                # Trellis is fused; narrow dim1 for this shard
-                out_tiles_start = sum(s // 16 for s in output_partition_sizes[:shard_idx])
-                out_tiles_end = out_tiles_start + output_partition_sizes[shard_idx] // 16
-                dest = param.data[:, out_tiles_start:out_tiles_end, :]
+                # Ragged per-shard staging: shards may carry different K, so
+                # each shard's payload lives in its own exact-shape slot.
+                dest = layer._exl3_shard_trellis[shard_idx]
+                if dest.numel() == 0:
+                    # First arrival for this shard: adopt the exact-shape
+                    # payload (already TP-sharded above) as the slot's data.
+                    dest.data = sharded.detach().clone()
+                else:
+                    if tuple(dest.shape) != tuple(sharded.shape):
+                        raise RuntimeError(
+                            f"EXL3 linear trellis shape mismatch shard={shard_idx}: "
+                            f"dest {tuple(dest.shape)} != loaded {tuple(sharded.shape)}"
+                        )
+                    dest.data.copy_(sharded)
             elif suffix == "suh":
                 # Suh per-shard
                 dest = param.data[shard_idx]
@@ -4611,9 +5053,11 @@ class Exl3LinearMethod(LinearMethodBase):
                 # bf16 shards don't use LinearEXL3; store None as placeholder
                 linears.append(None)
                 continue
-            out_tiles_start = sum(s // 16 for s in output_sizes[:i])
-            out_tiles_end = out_tiles_start + output_sizes[i] // 16
-            trellis_shard = layer.trellis[:, out_tiles_start:out_tiles_end, :].contiguous()
+            trellis_shard = layer._exl3_shard_trellis[i].detach().contiguous()
+            if trellis_shard.numel() == 0:
+                raise RuntimeError(
+                    f"EXL3 linear shard {i}: trellis payload never loaded"
+                )
             suh_shard = layer.suh[i].contiguous()
             svh_shard = layer.svh[
                 sum(output_sizes[:i]) : sum(output_sizes[: i + 1])
@@ -4627,7 +5071,7 @@ class Exl3LinearMethod(LinearMethodBase):
             linears.append(linear)
 
         layer._exl3_linears = linears
-        layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "linear")
+        layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "linear", self)
 
         # Keep bf16 weights if present, remove weight staging param if all loaded
         if bf16_shards and hasattr(layer, "weight"):
@@ -4654,6 +5098,12 @@ class Exl3LinearMethod(LinearMethodBase):
                     delattr(layer, param_name)
                 except Exception:
                     pass
+        # Ragged per-shard staging slots are consumed into LinearEXL3 above.
+        if hasattr(layer, "_exl3_shard_trellis"):
+            try:
+                delattr(layer, "_exl3_shard_trellis")
+            except Exception:
+                pass
 
     def apply(
         self,

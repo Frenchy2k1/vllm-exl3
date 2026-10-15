@@ -13,7 +13,12 @@ from typing import Any
 def _physical_k_values(inners: list[dict[str, Any]]) -> set[int]:
     values: set[int] = set()
     for pack in inners:
+        gateless = pack.get("gate") is None
         for projection in ("gate", "up", "down"):
+            if gateless and projection == "gate":
+                # Non-gated MoE (NemotronH): no gate projection exists; the
+                # fused state aliases up pointer tables into the gate slots.
+                continue
             linear = pack[projection]
             k = getattr(linear, "K", None)
             if k is None:
@@ -40,19 +45,29 @@ def install_physical_fused_k_compat(exl3_module: Any) -> None:
         return
 
     def wrapped(layer: Any, inners: list[dict[str, Any]]) -> None:
-        physical = _physical_k_values(inners)
-        if len(physical) != 1:
-            raise RuntimeError(
-                "EXL3 fused MoE requires one physical K across gate/up/down and "
-                f"all local experts; loaded K values={sorted(physical)}"
-            )
-        physical_k = next(iter(physical))
-        if not 1 <= physical_k <= 8:
-            raise RuntimeError(
-                f"EXL3 fused MoE physical K={physical_k} is outside K1-K8"
-            )
+        mixed_k = bool(getattr(layer, "_exl3_mixed_k", False))
+        if not mixed_k:
+            physical = _physical_k_values(inners)
+            if len(physical) != 1:
+                raise RuntimeError(
+                    "EXL3 fused MoE requires one physical K across gate/up/down and "
+                    f"all local experts; loaded K values={sorted(physical)}"
+                )
+            physical_k = next(iter(physical))
+            if not 1 <= physical_k <= 8:
+                raise RuntimeError(
+                    f"EXL3 fused MoE physical K={physical_k} is outside K1-K8"
+                )
 
         original(layer, inners)
+
+        if mixed_k:
+            # Mixed-K layers carry per-expert K arrays and per-K-group dispatch
+            # tables installed by the original builder; the scalar fused K is
+            # intentionally invalid there. Enforcing one physical K here would
+            # reject every heterogeneous pack (e.g. NemotronH up-K4/down-K5).
+            return
+
         configured = int(getattr(layer, "_exl3_bits", physical_k))
         layer._exl3_k = physical_k
         layer._exl3_physical_fused_k = physical_k
