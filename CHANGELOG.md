@@ -4,6 +4,39 @@
 
 ### Added
 
+- NemotronH (gateless relu2 MoE) support under vLLM 0.31.0, validated with
+  Nemotron-Super-VL SAGE EXL3 3.85bpw on GB10: full 163,840-tensor expert load
+  across 40 MoE layers, end-to-end generation, and prefill at 665.8 tok/s
+  measured by vLLM on a 6,336-token prompt — 1.7x the 392 tok/s standalone
+  exllamav3-fork path on the same pack. Components: `MOE_ACT_RELU2_NOGATE`
+  with gate-slot aliasing (the up pointer tables are aliased into the gate
+  slots and never dereferenced), a w1->w3 remap for upstream's gateless
+  checkpoint mapping (`ckpt_gate_proj_name="up_proj"`), gateless-safe
+  prescan/arena planning, and an inplace-relu fat-path activation.
+- `models/loader_shim.py` (`--load-format exl3_standalone_nemotron`): a
+  `DefaultModelLoader` subclass that rewrites standalone-saved checkpoint
+  names in the streaming iterator (`backbone.*` -> `language_model.backbone.*`,
+  `lm_head.*` -> `language_model.lm_head.*`, `mtp.*` dropped) so packs saved
+  under standalone HF names load under vLLM's NanoNemotronVL wrapper, whose
+  `is_llm()` filter otherwise silently drops every such tensor. No files are
+  modified on disk.
+- Mixed-K fast path: per-projection physical K in the fat path (packs with
+  different K per projection, e.g. up K4 / down K5), per-K-group dispatch
+  tables on sm_121 (`VLLM_EXL3_MIXEDK_MODE=grouped|unified`), and a bypass
+  of the one-physical-K enforcement for genuinely mixed-K layers.
+- Ragged per-shard linear staging for non-128-aligned shards, non-routed
+  coverage derived from the tensor_storage sidecar (`VLLM_EXL3_MODEL_DIR`),
+  fused `qkv_proj` name resolution, and construction-time `language_model.`
+  prefix normalization so wrapper-prefixed queries resolve against
+  inner-relative coverage keys.
+
+### Changed
+
+- `tests/test_exl3_linear.py` / `tests/test_loader_parity.py`: TP-slicing and
+  qkv-parity tests now assert against the per-shard slots (behavior preserved;
+  only the storage location moved). `mixed_mul1` is skipped with an explicit
+  capability-gap marker (padded multi-shard bf16 geometry is not implemented).
+
 - Per-layer chunk rotation for the aligned MoE TP split (`VLLM_EXL3_MOE_TP_ROTATE=1`, #40). Without
   it the uneven split's larger chunks land on the same ranks in every layer — 70.1 vs 56.8 GiB of
   weights per rank on DSV4.1-Flash, where the heavy ranks cap the KV cache for the whole TP group.
