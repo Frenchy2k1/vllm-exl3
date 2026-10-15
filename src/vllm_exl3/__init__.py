@@ -76,7 +76,7 @@ def register() -> None:
     # instead of language_model.backbone.*) need the name-rewriting loader.
     # Importing registers the load format; runs are started with
     # --load-format exl3_standalone_nemotron.
-    from . import loader_shim  # noqa: F401
+    from .models import loader_shim  # noqa: F401
 
 
 def runtime_diagnostics():
