@@ -31,6 +31,7 @@ import math
 import os
 import time
 from collections import defaultdict
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import re
@@ -602,6 +603,21 @@ def _prescan_shape(model_dir: str, shard: str, key: str):
     return tbl.get(key)
 
 
+@lru_cache(maxsize=8)
+def _main_stack_num_layers(model_dir: str) -> int | None:
+    """``num_hidden_layers`` of the main stack (DSpark draft layers sit after it)."""
+    try:
+        with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        return None
+    for holder in (cfg.get("text_config") or {}, cfg):
+        n = holder.get("num_hidden_layers")
+        if isinstance(n, int):
+            return n
+    return None
+
+
 def _try_prescan_trellis_shapes(
     layer: Any,
     num_experts: int,
@@ -658,6 +674,13 @@ def _try_prescan_trellis_shapes(
             break
     else:
         prefix = f"layers.{layer_id}.ffn.experts."
+    # DSpark builds its draft layers as ``model.layers.<num_hidden_layers + i>``
+    # while the checkpoint names them ``mtp.<i>``; without this the prescan
+    # misses every draft expert and the load falls back to host staging.
+    prefixes = [prefix]
+    _nhl = _main_stack_num_layers(model_dir)
+    if _nhl is not None and layer_id >= _nhl:
+        prefixes.append(f"mtp.{layer_id - _nhl}.ffn.experts.")
     gateless = moe_layer_is_gateless(layer)
     # Checkpoint-side names: the historical layout stores gate/up/down as
     # w1/w3/w2; NemotronH stores up_proj/down_proj (no gate). vLLM maps both
@@ -677,9 +700,12 @@ def _try_prescan_trellis_shapes(
         global_e = offset + local_e
         for proj, ckpt_name in ckpt_names.items():
             shard = None
-            for raw_prefix in ("", "backbone."):
-                key = f"{raw_prefix}{prefix}{global_e}.{ckpt_name}.trellis"
-                shard = weight_map.get(key)
+            for _p in prefixes:
+                for raw_prefix in ("", "backbone."):
+                    key = f"{raw_prefix}{_p}{global_e}.{ckpt_name}.trellis"
+                    shard = weight_map.get(key)
+                    if shard is not None:
+                        break
                 if shard is not None:
                     break
             if shard is None:
