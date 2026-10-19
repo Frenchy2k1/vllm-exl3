@@ -75,8 +75,15 @@ def register() -> None:
     # Standalone-saved NemotronH VL packs (text model saved under backbone.*
     # instead of language_model.backbone.*) need the name-rewriting loader.
     # Importing registers the load format; runs are started with
-    # --load-format exl3_standalone_nemotron.
-    from .models import loader_shim  # noqa: F401
+    # --load-format exl3_standalone_nemotron. The loader subclasses vLLM's
+    # DefaultModelLoader, so it only exists where vLLM itself is importable;
+    # without vLLM (CPU-only CI, offline tooling) there is no loader registry to
+    # register into and the rest of register() must still complete.
+    try:
+        from .models import loader_shim  # noqa: F401
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").split(".")[0] == "vllm":
+            raise
 
 
 def runtime_diagnostics():
