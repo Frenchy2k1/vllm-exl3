@@ -1546,7 +1546,8 @@ def _exl3_moe_temp_rows(temps) -> int:
     return int(TEMP_ROWS_FUSED)
 
 
-def _exl3_moe_tail(fn, temp_rows: int) -> tuple:
+def _exl3_moe_tail(fn, temp_rows: int, n_exp: int, k_max: int | None = None,
+                   expert_order=None) -> tuple:
     """Trailing arguments exllamav3 1.5.0 added to exl3_moe, or () for older bindings.
 
     1.5.0 appended output_scratch and fused_base (fp32 slot scratch plus slot table for
@@ -1559,6 +1560,18 @@ def _exl3_moe_tail(fn, temp_rows: int) -> tuple:
     k=3 on 1.5.0 against 52.22 on 1.4.7, 28.54 against 27.77 without a draft.
     """
     arity = _exl3_moe_arity(fn)
+    if k_max is not None:
+        # mixedk: the fork's K-specialised instances append k_max (and, with patch
+        # 03, the K-descending expert order) after m_tile. Passed explicitly because
+        # arity alone cannot separate this from the uniform binding's expert_lo/hi.
+        if arity is not None and arity >= EXL3_MOE_ARITY_ORDER:
+            return (None, None, 1, int(temp_rows), 16, int(k_max), expert_order)
+        if arity is not None and arity >= EXL3_MOE_ARITY_KMAX:
+            return (None, None, 1, int(temp_rows), 16, int(k_max))
+    if arity is not None and arity >= EXL3_MOE_ARITY_151:
+        # expert_lo/expert_hi default to "every expert": the kernel-side filter is
+        # a no-op until a caller narrows it (the packed K-group dispatch does).
+        return (None, None, 1, int(temp_rows), 16, 0, int(n_exp))
     if arity is not None and arity >= EXL3_MOE_ARITY_150:
         return (None, None, 1, int(temp_rows), 16)
     return ()
@@ -1779,6 +1792,35 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         layer._exl3_K_gate_arr = k_gate
         layer._exl3_K_up_arr = k_up
         layer._exl3_K_down_arr = k_down
+        # Largest K in the pack, as a host int read off the trellis shapes. It lets the
+        # launcher pick a K-specialised kernel instance (fewer live bits cases -> no
+        # spill, and the bits=8 stage size no longer reserves the shared memory a deeper
+        # pipeline needs) with no device sync and therefore no graph break.
+        # max over ALL THREE projections: an expert whose down K exceeds its up K would
+        # otherwise select an instance with too few bits cases (__builtin_unreachable).
+        layer._exl3_k_max_launch = int(
+            max(
+                int(pack[p].trellis.shape[-1])
+                for pack in inners
+                for p in ("gate", "up", "down")
+                if p in pack
+            )
+            // 16
+        )
+        # K-descending expert order (LPT). k_gate/k_up/k_down are per-expert load-time
+        # constants, so the permutation and its rank are computed once here and are free
+        # at decode time; the kernel then starts the 4x-expensive K=4 experts first, which
+        # is what the greedy ticket machine otherwise cannot know to do.
+        _kmax_e = torch.maximum(torch.maximum(k_gate, k_up), k_down)
+        layer._exl3_kdesc = torch.argsort(
+            _kmax_e, descending=True, stable=True
+        ).to(torch.int32).contiguous()
+        layer._exl3_krank = torch.empty(
+            layer._exl3_kdesc.shape, dtype=torch.int32, device=device
+        )
+        layer._exl3_krank[layer._exl3_kdesc.long()] = torch.arange(
+            layer._exl3_kdesc.numel(), dtype=torch.int32, device=device
+        )
         # Per-K-group dispatch (the GB10-qualified path): experts bucketed by
         # their (K_gate, K_up, K_down) tuple; each bucket runs one uniform-K
         # exl3_moe launch. The unified mixedk kernel is known to fault on
@@ -2399,6 +2441,19 @@ def apply_exl3_fused_moe(
     standard_local = local.masked_fill(fat_route, n_exp)
     standard_weight = flat_weight.masked_fill(fat_route, 0)
     order = standard_local.argsort()
+    expert_order = None
+    if _moe_lpt_enabled() and getattr(layer, "_exl3_kdesc", None) is not None:
+        # Rows grouped in the same (K rank, expert id) order the kernel will walk, so the
+        # running start/end offsets stay consistent with expert_count indexed by id.
+        kr = getattr(layer, "_exl3_krank")
+        sl = standard_local.long()
+        kr_local = torch.where(
+            standard_local < n_exp,
+            kr[sl.clamp(max=n_exp - 1)].long(),
+            torch.full_like(sl, n_exp),
+        )
+        order = (kr_local * (n_exp + 1) + sl).argsort(stable=True)
+        expert_order = layer._exl3_kdesc
     token_sorted = flat_token[order]
     weight_sorted = standard_weight[order]
     standard_count = torch.zeros(
@@ -2523,7 +2578,13 @@ def apply_exl3_fused_moe(
             *getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS),
             float(limit) if (limit is not None and limit > 0) else 0.0,
         )
-        tail = _exl3_moe_tail(fn_mk, _exl3_moe_temp_rows(temps))
+        tail = _exl3_moe_tail(
+            fn_mk,
+            _exl3_moe_temp_rows(temps),
+            n_exp,
+            int(getattr(layer, "_exl3_k_max_launch", 8)),
+            expert_order,
+        )
         n_active_mk = -1 if _exl3_moe_accepts_num_active(fn_mk) else None
         if tail and n_active_mk is None:
             n_active_mk = -1
@@ -2560,7 +2621,7 @@ def apply_exl3_fused_moe(
             float(limit) if (limit is not None and limit > 0) else 0.0,
         )
         # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
-        tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
+        tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps), n_exp)
         if tail and n_active_host is None:
             n_active_host = -1
         if n_active_host is not None:
