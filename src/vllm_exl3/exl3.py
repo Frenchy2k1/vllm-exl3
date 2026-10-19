@@ -3441,6 +3441,26 @@ class Exl3MoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(self, layer: "RoutedExperts") -> FusedMoEQuantConfig | None:
         return None
 
+    def prepare_workspace(self, hidden_states, shared_workspace_size: int):
+        """Reserve the shared-expert scratch; the EXL3 routed path needs none.
+
+        vLLM's runner calls this whenever the fused MoE layer carries shared
+        experts that declare a workspace (the DSV4.1 block-FP8 shared MLP does).
+        The base implementation only knows how to lease from a modular kernel
+        (``self.moe_kernel``), which EXL3 does not use, so it raises. Allocate
+        the shared scratch exactly as ``FusedMoEKernelModularImpl.
+        _allocate_buffers`` would -- a flat uint8 buffer on the activation
+        device -- and return no routed workspace.
+        """
+        if not shared_workspace_size:
+            return None, None
+        import torch
+
+        ws = torch.empty(
+            (int(shared_workspace_size),), dtype=torch.uint8, device=hidden_states.device
+        )
+        return None, ws
+
     def create_weights(
         self,
         layer: "RoutedExperts",
