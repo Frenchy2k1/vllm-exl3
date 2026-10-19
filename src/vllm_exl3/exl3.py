@@ -46,6 +46,11 @@ except ImportError:
     F = None  # type: ignore[assignment]
     Parameter = None  # type: ignore[assignment]
 
+try:  # optional routing-frequency instrumentation; no-op unless enabled
+    from . import route_stats as _route_stats
+except Exception:  # pragma: no cover - instrumentation must never block import
+    _route_stats = None  # type: ignore[assignment]
+
 try:
     from vllm.logger import init_logger
     from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -2813,6 +2818,11 @@ def apply_exl3_experts(
     fused: bool | None = None,
 ) -> torch.Tensor:
     """Shipped routed-expert apply. `fused=None` honors EXL3_FUSED_MOE."""
+    # Routing-frequency counter (VLLM_EXL3_ROUTE_STATS=1).  Three tiny kernels
+    # on fixed-address buffers, no host sync, no allocation -- safe to capture
+    # in a CUDA graph and correct across replays.  No-op otherwise.
+    if _route_stats is not None:
+        _route_stats.record(layer, topk_ids)
     if getattr(layer, "_exl3_mixed_store", None) is not None:
         # Mixed-K with the fused mixedk kernel available — route through the
         # standard fused path which will dispatch to exl3_moe_mixedk.
