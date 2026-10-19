@@ -47,11 +47,11 @@ def test_arity_from_python_signature_and_unknown():
 
 
 def test_tail_is_empty_for_1_4_x():
-    assert exl3._exl3_moe_tail(_Bound(_pybind_doc(exl3.EXL3_MOE_ARITY_147)), 2048) == ()
+    assert exl3._exl3_moe_tail(_Bound(_pybind_doc(exl3.EXL3_MOE_ARITY_147)), 2048, 16) == ()
 
 
 def test_tail_reproduces_the_all_fused_launch_for_1_5_0():
-    tail = exl3._exl3_moe_tail(_Bound(_pybind_doc(exl3.EXL3_MOE_ARITY_150)), 2048)
+    tail = exl3._exl3_moe_tail(_Bound(_pybind_doc(exl3.EXL3_MOE_ARITY_150)), 2048, 16)
     assert tail == (None, None, 1, 2048, 16)
 
 
@@ -59,7 +59,7 @@ def test_unknown_arity_gets_no_tail():
     def fn(*a):
         return None
 
-    assert exl3._exl3_moe_tail(fn, 2048) == ()
+    assert exl3._exl3_moe_tail(fn, 2048, 16) == ()
 
 
 def _pybind_binding(n_args: int) -> _Bound:

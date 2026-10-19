@@ -151,8 +151,9 @@ def test_fat_scratch_keys_include_k_words_and_bucket_capacity(
 
     assert first is same_bucket
     assert first is not other_bitrate
-    assert ("cpu", 512, 16, 16, 64) in exl3._FAT_SCRATCH_CACHE
-    assert ("cpu", 512, 16, 16, 32) in exl3._FAT_SCRATCH_CACHE
+    # One scratch set per device: the second key evicts the first, so a long
+    # prefill cannot accumulate a set per (cap, k_words, up_words) it walks.
+    assert list(exl3._FAT_SCRATCH_CACHE) == [("cpu", 512, 16, 16, 32, 32)]
 
 
 def test_distinct_gate_and_up_suh_transforms_are_preserved(
