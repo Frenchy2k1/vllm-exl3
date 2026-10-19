@@ -812,9 +812,26 @@ def prepare_trellis_arena_plan(
         "final_bytes": 0,
         "temp_peak_bytes": 0,
     }
+    # ATS zero-copy aliases (VLLM_EXL3_ATS_ALIAS): aliased experts get no CUDA
+    # slot at all, so the arena is sized for the resident experts only.
+    ats_alias_bytes = 0
+    try:
+        from . import ats_alias as _ats
+
+        _n_ats = _ats.install_layer_aliases(layer, dest_device)
+        _al = _ats.layer_aliases(layer) or {}
+        ats_eids = {p: set(m) for p, m in _al.items() if m}
+        ats_alias_bytes = sum(e[2] for m in _al.values() for e in m.values())
+    except Exception as exc:  # never let an optional path break the load
+        logger.error("EXL3 ATS alias install failed (layer continuing resident): %r", exc)
+        ats_eids = {}
+    stats["ats_alias_experts"] = sum(len(v) for v in ats_eids.values())
+    stats["ats_alias_bytes"] = ats_alias_bytes
     for proj, plist in proj_to_plist.items():
         by_shape: dict[tuple[int, ...], list[int]] = defaultdict(list)
         for eid, shape in sorted((shapes_by_proj.get(proj) or {}).items()):
+            if ats_eids.get(proj) and int(eid) in ats_eids[proj]:
+                continue  # ATS-aliased: no CUDA slot, no arena bytes
             by_shape[tuple(int(x) for x in shape)].append(int(eid))
         arenas: list[Parameter] = []
         plan[proj] = {}
@@ -1069,6 +1086,22 @@ def _direct_fill_trellis_slot(
     if not eid_index or not plan:
         raise RuntimeError("EXL3 direct fill requires prepare_trellis_arena_plan")
     if expert_id not in eid_index[proj]:
+        # ATS-aliased expert: the Parameter already points at the mmap'd side
+        # file. Verify the checkpoint tensor matches the aliased shape, then
+        # drop the source instead of copying it into CUDA memory.
+        from . import ats_alias as _ats
+
+        want = _ats.alias_shape(layer, proj, expert_id)
+        if want is not None:
+            if tuple(int(x) for x in src.shape) != tuple(want):
+                raise RuntimeError(
+                    f"EXL3 ATS alias shape mismatch {proj} expert={expert_id}: "
+                    f"checkpoint {tuple(src.shape)} alias {want}"
+                )
+            _ats._STATS["skipped_fill_bytes"] += int(src.numel()) * int(src.element_size())
+            _ats._STATS["skipped_fill_calls"] += 1
+            _madv_dontneed_cpu_tensor(src)
+            return
         raise RuntimeError(
             f"EXL3 arena plan missing {proj} expert={expert_id} shape={tuple(src.shape)}"
         )
@@ -3858,6 +3891,19 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
             # Legacy: one independent Parameter allocation per expert.
             dest_device = owner_mod.w13_suh.device
+            # ATS alias (VLLM_EXL3_ATS_ALIAS): layers with no arena plan (the
+            # mtp.* DSpark experts) alias their trellis straight out of the
+            # side file instead of allocating CUDA storage.
+            from . import ats_alias as _ats_mod
+
+            _alias_p = _ats_mod.maybe_alias_expert(
+                owner_mod, _proj_from_shard_id(shard_id), int(expert_id), dest_device
+            )
+            if _alias_p is not None:
+                _alias_p.weight_loader = self._load_exl3
+                plist[expert_id] = _alias_p
+                del loaded, sharded, loaded_weight
+                return True if return_success else None
             if _exl3_mem_waterfall_enabled():
                 _exl3_mem_snapshot("AFTER_DEST_ALLOC", owner_mod)
             if (
