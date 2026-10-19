@@ -1482,6 +1482,12 @@ def get_moe_kernel_backend() -> str:
 
 
 def _exl3_moe_accepts_num_active(fn) -> bool:
+    return _exl3_moe_accepts_num_active_cached(fn)
+
+
+@lru_cache(maxsize=None)
+def _exl3_moe_accepts_num_active_cached(fn) -> bool:
+    """Cached: this runs on every MoE layer of every step (signature() is ~10 us)."""
     try:
         import inspect
 
@@ -1493,28 +1499,45 @@ def _exl3_moe_accepts_num_active(fn) -> bool:
     return "num_active" in doc or "arg29" in doc or doc.count("arg") >= 30
 
 
+@lru_cache(maxsize=None)
 def _exl3_mixedk_grouped_default() -> bool:
     """Whether per-K-group dispatch is the default for this device.
 
-    The unified exl3_moe_mixedk kernel hits an illegal memory access on
-    GB10 (sm_121) at layer 23 of the NemotronH pack; the per-K-group
-    uniform-K launches (the fork's EXL3_MIXEDK_LEGACY path, measured 392
-    tok/s prefill) are the qualified route there. On every other device the
-    unified kernel keeps its historical default.
+    Cached: it queries the device capability, and the dispatch runs per layer
+    per step.
+
+    Per-K-group dispatch costs one `exl3_moe` launch plus ~9 ATen kernels per
+    distinct (K_gate, K_up, K_down) tuple per layer per step, and each of those
+    launches runs only `MOE_SMS_PER_EXPERT` = 8 CTAs of the 48 the device has
+    (a group holds the experts that share one K tuple, which at decode is one
+    expert). The unified `exl3_moe_mixedk` launch keeps `concurrency` experts
+    in flight across the whole device, so it is the default here;
+    `VLLM_EXL3_MIXEDK_MODE=grouped` still selects the per-group path for A/B.
+
+    The historical sm_121 illegal-memory-access note this function used to
+    encode came from a NemotronH bring-up and is not a K-dependent bounds bug
+    (the mixedk kernel body is identical to the qualified uniform one). Its two
+    plausible mechanisms -- a K outside 1..8 silently skipping the GEMM, and the
+    self-resetting global ticket scheduler -- are both closed by the fork
+    patches this build carries. Qualification runs under compute-sanitizer; see
+    lanes/moe-integrate/GPU_JOB.md.
     """
-    if not (_TORCH_AVAILABLE and torch is not None and torch.cuda.is_available()):
-        return False
-    try:
-        major, minor = torch.cuda.get_device_capability()
-    except Exception:
-        return False
-    return (major, minor) == (12, 1)
+    return False
 
 
 # Positional arity of exllamav3's exl3_moe binding by release. The binding has no
 # parameter names, so the pybind docstring ("arg0: ..., arg34: ...") is the contract.
 EXL3_MOE_ARITY_147 = 30  # ..., act_limit, num_active            (exllamav3 <= 1.4.x)
 EXL3_MOE_ARITY_150 = 35  # + output_scratch, fused_base, count_lo, count_hi, m_tile (>= 1.5.0)
+EXL3_MOE_ARITY_151 = 37  # + expert_lo, expert_hi (K-group expert range, fork patch 02)
+EXL3_MOE_ARITY_KMAX = 36  # mixedk + k_max: largest K in the launch, picks a K-specialised instance
+EXL3_MOE_ARITY_ORDER = 37  # mixedk + k_max, expert_order: K-descending work order (LPT)
+
+
+def _moe_lpt_enabled() -> bool:
+    """Longest-processing-time MoE work order. Off by default: it is a 4-6% tail fix
+    that reorders the routed rows, so it must be A/B'd against the identity order."""
+    return os.environ.get("VLLM_EXL3_MOE_LPT", "0").strip().lower() in ("1", "true", "yes")
 
 
 def _exl3_moe_arity(fn) -> int | None:
@@ -1834,6 +1857,56 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         layer._exl3_k_groups = [
             (k_tuple, ids) for k_tuple, ids in sorted(groups.items())
         ]
+        # CUDA-graph-safe dispatch state, built once here (never per step):
+        #   * one device id tensor per K group, so the forward issues no H2D copy
+        #   * the group ordinal of every expert, so membership is a gather+compare
+        #     instead of ``torch.isin`` (and needs no host-side ``.item()`` check
+        #     to decide whether a group is empty: every group is launched, and an
+        #     empty group's rows all carry the n_exp skip sentinel).
+        _g_index = torch.full(
+            (n_exp + 1,), -1, dtype=torch.long, device=device
+        )
+        _g_ids = []
+        for _gi, (_k_tuple, _ids) in enumerate(layer._exl3_k_groups):
+            _t = torch.tensor(_ids, dtype=torch.long, device=device)
+            _g_ids.append(_t)
+            _g_index[_t] = _gi
+        layer._exl3_k_group_ids = _g_ids
+        layer._exl3_group_index = _g_index
+        # Packed K-group dispatch (VLLM_EXL3_MIXEDK_PACKED=1). Renumber the
+        # experts into K-tuple order so group gi owns one contiguous packed range
+        # [lo, hi) and every launch can share a single globally sorted token
+        # array. This is a SEPARATE pointer table: the unified mixedk path
+        # indexes _exl3_ptrs by original expert id, so permuting that table in
+        # place would silently feed the unified kernel the wrong experts.
+        if os.environ.get("VLLM_EXL3_MIXEDK_PACKED", "0") == "1":
+            ext_moe = getattr(exllamav3_ext, "exl3_moe", None)
+            if _exl3_moe_arity(ext_moe) is None or _exl3_moe_arity(ext_moe) < EXL3_MOE_ARITY_151:
+                raise RuntimeError(
+                    "VLLM_EXL3_MIXEDK_PACKED=1 needs the expert-range exl3_moe "
+                    f"binding (arity >= {EXL3_MOE_ARITY_151}); this build has "
+                    f"{_exl3_moe_arity(ext_moe)}. Rebuild the fork with patches/"
+                    "02-fork-uniform-expert-range.diff."
+                )
+            _order: list[int] = []
+            _ranges: list[tuple[int, int, int]] = []
+            for _gi, (_k_tuple, _ids) in enumerate(layer._exl3_k_groups):
+                _ranges.append((_gi, len(_order), len(_order) + len(_ids)))
+                _order.extend(_ids)
+            if len(_order) != n_exp:
+                raise RuntimeError(
+                    f"EXL3 K groups cover {len(_order)} of {n_exp} experts"
+                )
+            _perm = torch.tensor(_order, dtype=torch.long, device=device)
+            layer._exl3_ptrs_packed = {
+                _k: _v[_perm].contiguous() for _k, _v in layer._exl3_ptrs.items()
+            }
+            # packed id per local id. The sentinel bin (non-local / fat routes,
+            # value n_exp) maps to itself so the gather stays inside the table.
+            _pid = torch.full((n_exp + 1,), n_exp, dtype=torch.long, device=device)
+            _pid[_perm] = torch.arange(n_exp, dtype=torch.long, device=device)
+            layer._exl3_packed_id = _pid
+            layer._exl3_group_ranges = _ranges
     else:
         layer._exl3_k = int(layer._exl3_bits)
         layer._exl3_mixedk_unified = False
@@ -2480,29 +2553,77 @@ def apply_exl3_fused_moe(
         )
         if use_grouped:
             # Per-K-group dispatch (GB10-qualified): one uniform-K exl3_moe
-            # launch per distinct (K_gate, K_up, K_down) tuple. The unified
-            # mixedk kernel faults on sm_121 (illegal memory access at layer
-            # 23); this path never touches it.
+            # launch per distinct (K_gate, K_up, K_down) tuple. This is the
+            # A/B and fallback path; it never touches the unified mixedk kernel.
             gateless = bool(getattr(layer, "_exl3_gateless", False))
-            for (kg, ku, kd), ids in k_groups:
-                grp_mask = torch.isin(standard_local, torch.as_tensor(
-                    ids, device=standard_local.device, dtype=standard_local.dtype
-                ))
-                if not bool(grp_mask.any().item()):
-                    continue
-                grp_local = torch.where(grp_mask, standard_local, n_exp)
-                grp_weight = torch.where(grp_mask, standard_weight, torch.zeros_like(standard_weight))
-                grp_order = grp_local.argsort()
-                grp_token_sorted = flat_token[grp_order]
-                grp_weight_sorted = grp_weight[grp_order]
-                grp_count = torch.zeros(
-                    n_exp + 1, dtype=torch.long, device=grp_local.device
+            g_index = getattr(layer, "_exl3_group_index", None)
+            if g_index is None:
+                # Defensive: load-time state missing, fall back to per-expert sets.
+                g_index = torch.full(
+                    (n_exp + 1,), -1, dtype=torch.long, device=standard_local.device
                 )
-                grp_count.scatter_add_(
+                for _gi, (_kt, _ids) in enumerate(k_groups):
+                    g_index[torch.as_tensor(
+                        _ids, device=standard_local.device, dtype=torch.long
+                    )] = _gi
+                layer._exl3_group_index = g_index
+            # Every group is launched unconditionally: a group with no routed row
+            # in this batch passes the n_exp skip sentinel for all rows, and
+            # launching it costs a kernel launch instead of a host sync. A
+            # host-side "is this group empty" check (``.item()``) is what breaks
+            # CUDA graph capture and, worse, freezes the capture-time branch into
+            # every replay.
+            #
+            # Packed variant: experts are already renumbered into K-tuple order,
+            # so group gi owns the contiguous packed range [lo, hi) and every
+            # launch shares one globally sorted token array (fork patch 02 keeps
+            # the token offsets global). One gather + one argsort + one
+            # scatter_add per layer replaces ~9 kernels per K group.
+            packed_ids = getattr(layer, "_exl3_packed_id", None)
+            if packed_ids is not None:
+                p_ids = packed_ids[standard_local]
+                p_order = p_ids.argsort()
+                shared_token_sorted = flat_token[p_order]
+                shared_weight_sorted = standard_weight[p_order]
+                shared_count = torch.zeros(
+                    n_exp + 1, dtype=torch.long, device=standard_local.device
+                )
+                shared_count.scatter_add_(
                     0,
-                    grp_local.long(),
-                    torch.ones(grp_local.shape, dtype=torch.long, device=grp_local.device),
+                    p_ids,
+                    torch.ones(p_ids.shape, dtype=torch.long, device=p_ids.device),
                 )
+                ptr_tbl = layer._exl3_ptrs_packed
+                grp_ord = None
+            else:
+                ptr_tbl = ptrs
+                grp_ord = g_index[standard_local]
+            for gi, ((kg, ku, kd), _ids) in enumerate(k_groups):
+                if grp_ord is None:
+                    _lo, _hi = layer._exl3_group_ranges[gi][1:]
+                    grp_count = shared_count
+                    grp_token_sorted = shared_token_sorted
+                    grp_weight_sorted = shared_weight_sorted
+                else:
+                    _lo, _hi = 0, n_exp
+                    grp_mask = grp_ord == gi
+                    grp_local = torch.where(grp_mask, standard_local, n_exp)
+                    grp_weight = torch.where(
+                        grp_mask, standard_weight, torch.zeros_like(standard_weight)
+                    )
+                    grp_order = grp_local.argsort()
+                    grp_token_sorted = flat_token[grp_order]
+                    grp_weight_sorted = grp_weight[grp_order]
+                    grp_count = torch.zeros(
+                        n_exp + 1, dtype=torch.long, device=grp_local.device
+                    )
+                    grp_count.scatter_add_(
+                        0,
+                        grp_local.long(),
+                        torch.ones(
+                            grp_local.shape, dtype=torch.long, device=grp_local.device
+                        ),
+                    )
                 args_grp = (
                     xh,
                     out,
@@ -2514,26 +2635,30 @@ def apply_exl3_fused_moe(
                     temps[2],
                     temps[3],
                     moe_act,
-                    float(kg),
-                    float(ku),
-                    float(kd),
-                    ptrs["gate_trellis"],
-                    ptrs["gate_suh"],
-                    ptrs["gate_svh"],
-                    ptrs["up_trellis"],
-                    ptrs["up_suh"],
-                    ptrs["up_svh"],
-                    ptrs["down_trellis"],
-                    ptrs["down_suh"],
-                    ptrs["down_svh"],
+                    int(kg),
+                    int(ku),
+                    int(kd),
+                    ptr_tbl["gate_trellis"],
+                    ptr_tbl["gate_suh"],
+                    ptr_tbl["gate_svh"],
+                    ptr_tbl["up_trellis"],
+                    ptr_tbl["up_suh"],
+                    ptr_tbl["up_svh"],
+                    ptr_tbl["down_trellis"],
+                    ptr_tbl["down_suh"],
+                    ptr_tbl["down_svh"],
                     *getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS),
                     float(limit) if (limit is not None and limit > 0) else 0.0,
                 )
-                tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
+                tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps), n_exp)
                 if tail and n_active_host is None:
                     n_active_host = -1
                 if n_active_host is not None:
-                    fn(*args_grp, n_active_host, *tail)
+                    _tail = list(tail)
+                    if len(_tail) >= 7:
+                        # (..., count_lo, count_hi, m_tile, expert_lo, expert_hi)
+                        _tail[-2], _tail[-1] = int(_lo), int(_hi)
+                    fn(*args_grp, n_active_host, *_tail)
                 else:
                     fn(*args_grp)
             if fat_possible and bool(fat.any().item()):
