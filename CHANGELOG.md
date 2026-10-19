@@ -30,7 +30,44 @@
   prefix normalization so wrapper-prefixed queries resolve against
   inner-relative coverage keys.
 
+- ATS zero-copy weight aliases on GB10 (`VLLM_EXL3_ATS_ALIAS=1`): routed-expert
+  trellis tensors and `embed.weight` are `ats_cuda_view`'d out of a
+  64-byte-aligned side file instead of allocated in CUDA, so they live in
+  reclaimable page cache and fault in from NVMe. Aliased experts take no arena
+  slot and no direct-fill copy. Cold-expert aliasing measures 298 -> 203
+  ms/step on DSV4.1-Flash-1017 v3 TP1. Off by default; a failed install logs
+  and leaves the layer resident.
+- `tools/ats_build_alias.py`: builds that side file, by layer list or by
+  measured cold set (`--select-npz route_stats.npz --budget-gib N`), with
+  `--experts-json`, `--rows` and `--select-only` for reviewing the selection
+  before spending the bytes. Read-only on the pack.
+- Per-layer routed-expert frequency counter (`VLLM_EXL3_ROUTE_STATS=1`): one
+  preallocated `int64[n_rows, n_experts]` device buffer and two counters, three
+  tiny kernels per forward, no host sync and no allocation, so it accumulates
+  correctly across CUDA graph replays. Feeds the cold-set selection above.
+- K-specialised mixed-K kernel instances: the plugin derives `k_max` from the
+  trellis widths (a load-time property, so no device sync) and the fork
+  instantiates a narrower kernel. The `K<=4` instance is +12-14% decode, 190
+  vs 200 ms/step in-model on DSV4.1-Flash-1017 v3 TP1.
+- K-descending expert order (`VLLM_EXL3_MOE_LPT=1`): rows are sorted by
+  (K rank, expert id) so the greedy ticket machine starts the 4x-expensive K=4
+  experts first instead of discovering the cost after scheduling. Off by
+  default — it reorders routed rows, so it must be A/B'd.
+- DSpark draft experts are prescanned under their checkpoint `mtp.*` names, so
+  the draft stack gets an arena plan instead of falling back to host staging.
+- `prepare_workspace` on the routed-experts method: allocates the shared-expert
+  scratch as `FusedMoEKernelModularImpl._allocate_buffers` would. Without it,
+  models whose shared MLP declares a workspace (DSV4.1 block-FP8) failed to
+  build.
+
 ### Changed
+
+- Unified `exl3_moe_mixedk` is the default mixed-K dispatch on every device.
+  Per-K-group dispatch costs one launch plus ~9 ATen kernels per K tuple per
+  layer per step at `MOE_SMS_PER_EXPERT` = 8 CTAs of 48, and at decode a group
+  holds one expert. `VLLM_EXL3_MIXEDK_MODE=grouped` still selects it, now
+  graph-safe (load-time group ids, no host-side emptiness check, and
+  `VLLM_EXL3_MIXEDK_PACKED=1` for one shared token array across groups).
 
 - `tests/test_exl3_linear.py` / `tests/test_loader_parity.py`: TP-slicing and
   qkv-parity tests now assert against the per-shard slots (behavior preserved;
@@ -43,6 +80,19 @@
   With rotation, rank `r` of layer `L` takes chunk `(r + L) % tp`. The MoE all-reduce sums rank
   partials, so outputs are unchanged and only ownership moves. The contributor measures 63.4 GiB on
   every rank and KV cache raised from 8 to 17 GiB per rank (2.45M to 5.22M tokens). Off by default.
+
+### Fixed
+
+- Fat-expert path on tensor-mixed-K packs: `packed13` concatenates gate and up
+  under one K, but these packs give the two projections different trellis
+  widths (16/32/48/64 inside one layer), so the copy raised
+  "size of tensor a (32) must match b (48)" and killed the engine on any
+  prefill chunk that made an expert fat — prompts above ~260 tokens. Each
+  projection is now reconstructed on its own when their shapes differ, and
+  `mcg`/`mul1` are read from their own tensor instead of borrowed from gate.
+- Fat-path scratch cache grew one full set per (cap, k_words, up_words) key
+  inside a single long prefill: 4.6 GiB, against the 240 MiB the run needs.
+  Now one set per device, dropped on insert.
 
 ## 0.5.0 (2026-09-25)
 
