@@ -1945,20 +1945,35 @@ def _apply_native_fused_moe(
     return native_out.to(dtype=torch.float32)
 
 
-_FAT_SCRATCH_CACHE: dict[tuple[str, int, int, int, int], dict[str, torch.Tensor]] = {}
+_FAT_SCRATCH_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
+_FAT_LOGGED = False
 
 
 def _fat_scratch(
-    device: torch.device, capacity: int, gate: Any
+    device: torch.device, capacity: int, gate: Any, up: Any | None = None
 ) -> dict[str, torch.Tensor]:
     hidden = int(getattr(gate, "in_features", 4096))
     intermediate = int(getattr(gate, "out_features", 2048))
     k_words = int(gate.trellis.shape[2])
+    # Tensor-mixed-K packs give gate/up different trellis widths per expert, and
+    # the packed13 buffer is only valid for one of them; key on both so a layer
+    # never reuses a scratch built for a different width pair.
+    up_words = (
+        int(up.trellis.shape[2])
+        if up is not None and getattr(up, "trellis", None) is not None
+        else k_words
+    )
     bucketed_cap = max(256, ((int(capacity) + 255) // 256) * 256)
-    key = (str(device), bucketed_cap, intermediate, hidden, k_words)
+    key = (str(device), bucketed_cap, intermediate, hidden, k_words, up_words)
     scratch = _FAT_SCRATCH_CACHE.get(key)
     if scratch is not None:
         return scratch
+    # Keep one scratch set per device.  A tensor-mixed-K pack rotates through
+    # several (cap, k_words, up_words) keys inside one long prefill, and caching
+    # one set per key grew to ~3 GiB during a 2 K-token chunk (guard3 killed the
+    # engine at 240 MiB).  Dropping the previous set only releases the cache's
+    # reference; the caller's local dict keeps it alive while in use.
+    _FAT_SCRATCH_CACHE.clear()
 
     in_tiles, out_tiles, k_words = map(int, gate.trellis.shape)
     scratch = {
@@ -2042,6 +2057,13 @@ def apply_exl3_batched_fat(
         offset += n_rows
         if n_rows <= cap:
             continue
+        global _FAT_LOGGED
+        if not _FAT_LOGGED:
+            _FAT_LOGGED = True
+            logger.info(
+                "EXL3 fat expert path ACTIVE (first: expert=%d rows=%d cap=%d)"
+                % (e, n_rows, cap)
+            )
 
         token_idx = token_sorted[start:offset]
         gate = inners[e]["gate"]
@@ -2050,8 +2072,17 @@ def apply_exl3_batched_fat(
         gateless = gate is None
         if gateless:
             gate = up  # gate slots alias up; the gate GEMM is skipped below
-        scratch = _fat_scratch(xh.device, n_rows, gate)
+        scratch = _fat_scratch(xh.device, n_rows, gate, up)
         intermediate = int(gate.out_features)
+        # Tensor-mixed-K packs (this one) carry a different trellis width per
+        # projection *and per expert*: k_words is 16/32/48/64 inside one layer,
+        # so gate and up need not agree.  ``packed13`` concatenates the two
+        # projections under a single K, so it is only usable when their trellis
+        # shapes match exactly; otherwise each projection is reconstructed on
+        # its own into ``w_gate``/``w_up``.  (Until this check existed the
+        # copy_ below raised a shape RuntimeError, which killed the engine on
+        # any prefill chunk that made an expert fat -- see REPORT-phase5.md.)
+        distinct_gu = tuple(gate.trellis.shape) != tuple(up.trellis.shape)
 
         h = scratch["h"][:n_rows]
         h13 = scratch["h13"][:n_rows]
@@ -2062,17 +2093,19 @@ def apply_exl3_batched_fat(
             shared_suh = bool(torch.equal(gate.suh, up.suh))
             inners[e]["_exl3_gate_up_shared_suh"] = shared_suh
         distinct_suh = not shared_suh
-        if not distinct_suh:
+        distinct_pack = distinct_suh or distinct_gu
+        if not distinct_pack:
             ext.had_r_128(h, h13, gate.suh, None, 1.0)
 
         packed13 = scratch["packed13"]
         out_tiles = int(gate.trellis.shape[1])
-        packed13[:, :out_tiles].copy_(gate.trellis)
-        packed13[:, out_tiles:].copy_(up.trellis)
         gate_up = scratch["gate_up"][:n_rows]
         svh13 = scratch["svh13"]
-        svh13[:intermediate].copy_(gate.svh)
-        svh13[intermediate:].copy_(up.svh)
+        if not distinct_pack:
+            packed13[:, :out_tiles].copy_(gate.trellis)
+            packed13[:, out_tiles:].copy_(up.trellis)
+            svh13[:intermediate].copy_(gate.svh)
+            svh13[intermediate:].copy_(up.svh)
 
         # Per-projection physical K: mixed-K packs carry different K per
         # projection (e.g. NemotronH up-K4/down-K5). The w13 side must use the
@@ -2081,18 +2114,20 @@ def apply_exl3_batched_fat(
         k_gate = int(getattr(gate, "K", 4))
         k_up = int(getattr(up, "K", k_gate))
         k_down = int(getattr(down, "K", k_up))
-        if not gateless and (k_gate != k_up):
+        if not gateless and not distinct_gu and (k_gate != k_up):
             raise RuntimeError(
-                "EXL3 fat path requires equal gate/up K; got "
+                "EXL3 fat packed gate/up path requires equal gate/up K; got "
                 f"gate K={k_gate} up K={k_up}"
             )
-        mcg_up = bool(getattr(gate, "mcg", True))
-        mul1_up = bool(getattr(gate, "mul1", False))
+        mcg_gate = bool(getattr(gate, "mcg", True))
+        mul1_gate = bool(getattr(gate, "mul1", False))
+        mcg_up = bool(getattr(up, "mcg", mcg_gate))
+        mul1_up = bool(getattr(up, "mul1", mul1_gate))
         mcg_down = bool(getattr(down, "mcg", mcg_up))
         mul1_down = bool(getattr(down, "mul1", mul1_up))
 
         if (
-            not distinct_suh
+            not distinct_pack
             and use_kernel
             and k_up == 4
             and mcg_up
@@ -2104,14 +2139,14 @@ def apply_exl3_batched_fat(
                 h13, packed13, gate_up, svh13, k_up, mcg_up, mul1_up
             )
         else:
-            if distinct_suh:
+            if distinct_pack:
                 gate_h = h13
                 up_h = h
                 ext.had_r_128(h, gate_h, gate.suh, None, 1.0)
                 ext.had_r_128(up_h, up_h, up.suh, None, 1.0)
                 w_gate = scratch["w_gate"]
                 w_up = scratch["w_up"]
-                ext.reconstruct(w_gate, gate.trellis, k_gate, mcg_up, mul1_up)
+                ext.reconstruct(w_gate, gate.trellis, k_gate, mcg_gate, mul1_gate)
                 ext.reconstruct(w_up, up.trellis, k_up, mcg_up, mul1_up)
                 # Contiguous temporaries: ext.hgemm / ext.had_r_128 read and
                 # write row-major contiguous matrices, and a column slice of
@@ -2128,7 +2163,7 @@ def apply_exl3_batched_fat(
                 ext.hgemm(h13, w13, gate_up)
                 ext.had_r_128(gate_up, gate_up, None, svh13, 1.0)
 
-        if distinct_suh:
+        if distinct_pack:
             gate_out = scratch["g_tmp"][:n_rows]
             up_out = scratch["u_tmp"][:n_rows]
         else:
