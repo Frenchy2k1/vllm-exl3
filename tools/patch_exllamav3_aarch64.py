@@ -105,6 +105,8 @@ void perform_cpu_reduce_avx512(PGContext*, size_t, uint32_t, uint32_t, uint8_t*,
         """#include "moe_mul1.h"
 #include <cstdlib>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 int64_t exl3_moe_cpu_make_layer(
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
     const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
@@ -128,6 +130,12 @@ bool exl3_moe_cpu_has_avx512_vnni() { return false; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
 bool exl3_moe_cpu_has_avx512_bw() { return false; }
 int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { throw std::runtime_error("CPU MoE is disabled in this ARM64 build"); }
+// Declared by newer exllamav3 trees (pool wake-up, core order and the packed-layout rules).
+// CPU MoE is compiled out here, so they report "no pool, native layout".
+void exl3_moe_cpu_pool_prime(int) {}
+std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order() { return {std::vector<int64_t>(), 0}; }
+int exl3_moe_cpu_swizzle_group(double) { return 0; }
+int exl3_moe_cpu_planar_layout(double) { return 0; }
 """,
     )
 
@@ -162,6 +170,10 @@ int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { throw std::runtime_error(
             write(path, source.replace(old, new))
         elif new in source:
             print("already patched", path)
+        elif "EXL3_AARCH64_PAUSE" in source:
+            # Newer exllamav3 trees guard the spin hint themselves (aarch64 'yield' before the
+            # x86 intrinsics), so there is nothing left to rewrite.
+            print("already guarded upstream (EXL3_AARCH64_PAUSE)", path)
         else:
             raise SystemExit(f"expected one x86 pause block in {path}")
 
