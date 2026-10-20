@@ -19,6 +19,18 @@ PAUSE_BLOCK = re.compile(
     r"[ \t]*#endif\b",
     re.MULTILINE,
 )
+# Newer exllamav3 trees guard the spin hint upstream: the ARM branch comes first and the x86
+# intrinsics only remain in the #elif/#else branches that an aarch64 compile never sees.
+UPSTREAM_PAUSE_BLOCK = re.compile(
+    r"^[ \t]*#if[ \t]+defined\(__aarch64__\)[ \t]*\|\|[ \t]*defined\(__arm__\)[ \t]*\n"
+    r"[ \t]*asm[ \t]+volatile\(\"yield\"[^;]*\);[ \t]*\n"
+    r"[ \t]*#elif[ \t]+defined\(__linux__\)[ \t]*\n"
+    r"[ \t]*__builtin_ia32_pause\(\);[ \t]*\n"
+    r"[ \t]*#else[ \t]*\n"
+    r"[ \t]*_mm_pause\(\);[ \t]*\n"
+    r"[ \t]*#endif\b",
+    re.MULTILINE,
+)
 PAUSE_CALL = re.compile(r"\b(?:__builtin_ia32_pause|_mm_pause)\s*\(")
 
 
@@ -33,11 +45,12 @@ def verify_pause_source(source: str, name: str) -> None:
     )
     source = source.replace("\r\n", "\n")
     remaining, count = PAUSE_BLOCK.subn("", source)
-    if count != 1:
+    remaining, upstream = UPSTREAM_PAUSE_BLOCK.subn("", remaining)
+    if count + upstream != 1:
         raise ValueError(f"{name}: expected one x86-only pause block with a portable yield fallback")
     if PAUSE_CALL.search(remaining):
         raise ValueError(f"{name}: pause intrinsic outside the verified architecture guard")
-    if not re.search(r"^\s*#include\s*<thread>", source, re.MULTILINE):
+    if count and not re.search(r"^\s*#include\s*<thread>", source, re.MULTILINE):
         raise ValueError(f"{name}: portable yield requires <thread>")
 
 
